@@ -38,7 +38,7 @@ class ProviderSpec:
 
 PROVIDERS: dict[str, ProviderSpec] = {
     "custom_openai": ProviderSpec(
-        fetchers.fetch_openai_compatible, "", needs_key=False, custom_base=True
+        fetchers.fetch_custom_openai_compatible, "", needs_key=False, custom_base=True
     ),
     "openai": ProviderSpec(fetchers.fetch_openai, "https://api.openai.com/v1"),
     "anthropic": ProviderSpec(fetchers.fetch_anthropic, "https://api.anthropic.com/v1"),

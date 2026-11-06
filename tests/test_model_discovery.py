@@ -246,6 +246,51 @@ async def test_results_are_cached_until_refresh():
     assert len(calls) == 2
 
 
+async def test_custom_openai_fetches_image_models_separately():
+    # Arrange
+    calls: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        image_filter = request.url.params.get("model_type")
+        calls.append(image_filter)
+        if image_filter == "image_generation":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "recraft-v4",
+                            "name": "Recraft",
+                            "model_type": "image_generation",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"data": [{"id": "glm-5", "name": "GLM"}]})
+
+    # Act
+    async with _client(handler) as client:
+        llm = await model_discovery.discover_models(
+            "custom_openai",
+            "llm",
+            "ck",
+            base_url="https://gateway.example/v1",
+            client=client,
+        )
+        image = await model_discovery.discover_models(
+            "custom_openai",
+            "image",
+            "ck",
+            base_url="https://gateway.example/v1",
+            client=client,
+        )
+
+    # Assert
+    assert calls == [None, "image_generation"]
+    assert _ids(llm) == ["glm-5"]
+    assert _ids(image) == ["recraft-v4"]
+
+
 async def test_black_forest_labs_uses_static_list():
     # Act
     result = await model_discovery.discover_models("black_forest_labs", "image", "bk")

@@ -92,16 +92,18 @@ async def fetch_openai(
 async def fetch_openai_compatible(
     client: httpx.AsyncClient, api_key: Optional[str], base_url: str
 ) -> list[DiscoveredModel]:
-    """DeepSeek, Kimi and MiniMax only serve chat models from /models.
-
-    Gateways like ZvenoAI additionally expose image models via the vendor-specific
-    `?model_type=image_generation` filter; those are merged in when supported.
-    """
-    headers = _bearer(api_key)
-    payload = await _get_json(client, f"{base_url}/models", headers=headers)
+    """DeepSeek, Kimi and MiniMax only serve chat models from /models."""
+    payload = await _get_json(client, f"{base_url}/models", headers=_bearer(api_key))
     models = (_model(i.get("id"), i.get("name") or i.get("id"), LLM) for i in _items(payload))
-    found = [m for m in models if m]
-    found.extend(await _fetch_gateway_image_models(client, headers, base_url))
+    return [m for m in models if m]
+
+
+async def fetch_custom_openai_compatible(
+    client: httpx.AsyncClient, api_key: Optional[str], base_url: str
+) -> list[DiscoveredModel]:
+    """Fetch chat models and merge separately listed image models from custom gateways."""
+    found = await fetch_openai_compatible(client, api_key, base_url)
+    found.extend(await _fetch_gateway_image_models(client, _bearer(api_key), base_url))
     return found
 
 
