@@ -74,6 +74,7 @@ add_exclude() {
 
 add_exclude '/AGENTS.local.md'
 add_exclude '/HANDOFF.local.md'
+add_exclude '/.kimi-code/'
 add_exclude '/.local/'
 
 copy_if_missing() {
@@ -85,9 +86,13 @@ copy_if_missing() {
     fi
 }
 
+if [ ! -d "$root/.kimi-code" ]; then
+    mkdir -p "$root/.kimi-code"
+fi
 copy_if_missing "$script_dir/templates/AGENTS.local.md" "$root/AGENTS.local.md"
 copy_if_missing "$script_dir/templates/HANDOFF.local.md" "$root/HANDOFF.local.md"
+copy_if_missing "$script_dir/templates/kimi-code-AGENTS.md" "$root/.kimi-code/AGENTS.md"
 
 printf '\nBootstrap complete.\n'
 printf 'Code branch: %s\n' "$(git -C "$root" branch --show-current)"
-printf 'Next: install project dependencies, configure local secrets, and point your agent to AGENTS.local.md.\n'
+printf 'Next: install dependencies, configure local secrets, and restart your agent to load project instructions.\n'

@@ -23,6 +23,7 @@ Added:
 Fixed:
 
 - Scoped gateway image-model discovery to `custom_openai`, restoring upstream behavior and caching expectations for DeepSeek, Kimi, and MiniMax.
+- Replaced global agent instructions with the project-scoped untracked `.kimi-code/AGENTS.md`; bootstrap now creates it without changing files outside the project.
 
 Verified:
 

@@ -86,6 +86,7 @@ function Add-Exclude {
 
 Add-Exclude "/AGENTS.local.md"
 Add-Exclude "/HANDOFF.local.md"
+Add-Exclude "/.kimi-code/"
 Add-Exclude "/.local/"
 
 function Copy-IfMissing {
@@ -96,10 +97,15 @@ function Copy-IfMissing {
     }
 }
 
+$KimiProjectDir = Join-Path $Root ".kimi-code"
+if (-not (Test-Path -LiteralPath $KimiProjectDir)) {
+    New-Item -ItemType Directory -Path $KimiProjectDir | Out-Null
+}
 Copy-IfMissing (Join-Path $ScriptDir "templates/AGENTS.local.md") (Join-Path $Root "AGENTS.local.md")
 Copy-IfMissing (Join-Path $ScriptDir "templates/HANDOFF.local.md") (Join-Path $Root "HANDOFF.local.md")
+Copy-IfMissing (Join-Path $ScriptDir "templates/kimi-code-AGENTS.md") (Join-Path $KimiProjectDir "AGENTS.md")
 
 Write-Host ""
 Write-Host "Bootstrap complete."
 Write-Host "Code branch: $(& git -C $Root branch --show-current)"
-Write-Host "Next: install project dependencies, configure local secrets, and point your agent to AGENTS.local.md."
+Write-Host "Next: install dependencies, configure local secrets, and restart your agent to load project instructions."

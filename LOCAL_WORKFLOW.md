@@ -146,7 +146,7 @@ Known-good integration snapshots may be tagged as `local/YYYY-MM-DD` or `local/Y
 
 ## 11. Multi-device rule
 
-Everything portable belongs in `origin`: code branches, `local/meta`, and optional recovery tags. Each device owns only dependencies, secrets, application data, `.git/info/exclude`, `AGENTS.local.md`, and `HANDOFF.local.md`.
+Everything portable belongs in `origin`: code branches, `local/meta`, and optional recovery tags. Each device owns only dependencies, secrets, application data, `.git/info/exclude`, `AGENTS.local.md`, `HANDOFF.local.md`, and untracked project-scoped agent instructions such as `.kimi-code/AGENTS.md`. Never require global agent instructions for this workflow.
 
 Use `BOOTSTRAP.md` on a new device. Do not copy another machine's `HANDOFF.local.md`, virtual environments, or secrets into Git. Update the meta worktree with `git -C .local/meta pull --ff-only`.
 

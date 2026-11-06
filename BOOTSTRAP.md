@@ -12,9 +12,9 @@ The scripts are idempotent and non-destructive. They:
 - create or update tracking for `local/integration` and `local/meta`;
 - switch a clean code checkout to `local/integration`;
 - add only local entries to `.git/info/exclude`;
-- create `AGENTS.local.md` and `HANDOFF.local.md` from templates only when absent.
+- create `AGENTS.local.md`, `HANDOFF.local.md`, and the project-scoped `.kimi-code/AGENTS.md` from templates only when absent.
 
-They do not install application dependencies, change secrets, copy game data, overwrite existing local files, clean untracked artifacts, commit, or push. Tracked uncommitted changes stop the script before any setup changes.
+They do not install application dependencies, change secrets, copy game data, overwrite existing local files, clean untracked artifacts, write outside the project, commit, or push. Tracked uncommitted changes stop the script before any setup changes.
 
 ## Prerequisites
 
@@ -68,10 +68,9 @@ Existing `AGENTS.local.md` and `HANDOFF.local.md` are preserved. The duplicate e
 2. Install the project's Python and frontend dependencies using the standard project setup. No `requirements.txt` export needs to be copied from another device.
 3. Apply Alembic migrations when required by the code checkout.
 4. Configure `.env`, Provider Vault credentials, and any desired non-secret provider/model settings. Never commit these values.
-5. Configure the agent to read the root `AGENTS.local.md` at the start of every TaleWeaver task. This entry point is intentionally untracked, so agent-specific user-level setup is required on each device.
-   - Kimi Code: append the contents of `templates/kimi-AGENTS.md` to `$KIMI_CODE_HOME/AGENTS.md` (by default `~/.kimi-code/AGENTS.md`), preserving any existing instructions. Start a new session after editing.
-   - Other agents: add the equivalent user-level instruction to read `AGENTS.local.md`; do not modify the tracked upstream `AGENTS.md` for this purpose.
-6. Restart or reload the agent as required by that tool.
+5. Keep agent instructions project-scoped. Bootstrap creates the untracked `.kimi-code/AGENTS.md`, which Kimi Code discovers automatically only in this project. No global or user-level instruction file is changed or required.
+   - Other agents: use their project-scoped local instruction mechanism to read `AGENTS.local.md`; do not modify global instructions or the tracked upstream `AGENTS.md` for this purpose.
+6. Start a new agent session so the project instructions are loaded.
 7. Read `LOCAL_WORKFLOW.md` before creating or updating branches.
 
 No game environment needs to be transferred for development. Existing sessions, databases, adventures, and generated media are only needed if the device must reproduce a specific runtime environment.
@@ -101,6 +100,7 @@ Expected state:
 - `.local/meta` is on `local/meta`;
 - `main` tracks `upstream/main`;
 - integration and meta track their `origin` counterparts;
-- `AGENTS.local.md`, `HANDOFF.local.md`, and `.local/` do not appear as untracked code files.
+- `AGENTS.local.md`, `HANDOFF.local.md`, `.kimi-code/`, and `.local/` do not appear as untracked code files;
+- no global agent instruction file is needed or modified.
 
 If the meta worktree is missing but `.local/meta` contains unexpected files, stop and inspect them instead of deleting or overwriting the directory.
