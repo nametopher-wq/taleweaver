@@ -17,6 +17,7 @@ LLM_PROVIDERS = [
 IMAGE_PROVIDERS = [
     {"id": "openai", "name": "OpenAI"},
     {"id": "openrouter", "name": "OpenRouter (Various)"},
+    {"id": "custom_openai", "name": "OpenAI-Compatible (Custom)"},
     {"id": "black_forest_labs", "name": "Black Forest Labs"},
     {"id": "google", "name": "Google Gemini"},
     {"id": "ollama", "name": "Ollama (Local)"},
@@ -42,6 +43,13 @@ PREDEFINED_LLM_MODELS = {
 }
 
 PREDEFINED_IMAGE_MODELS = {
+    "custom_openai": [
+        "openai/gpt-image-2",
+        "openai/gpt-image-1.5",
+        "bytedance-seed/seedream-4.5",
+        "google/gemini-3-pro-image-preview",
+        "black-forest-labs/flux.2-klein-4b",
+    ],
     "openai": ["gpt-image-1-mini", "gpt-image-1.5", "gpt-image-2"],
     "openrouter": [
         "black-forest-labs/flux.2-klein-4b",

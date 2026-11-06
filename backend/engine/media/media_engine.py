@@ -5,6 +5,7 @@ Integrated with LiteLLM to support OpenAI (DALL-E), OpenRouter, and Google (Imag
 
 import asyncio
 import base64
+import functools
 import logging
 import os
 import re
@@ -46,6 +47,7 @@ from backend.engine.media.image_generation_support import (
     openrouter_headers,
     placeholder_extension,
     poll_bfl_sample_url,
+    post_custom_openai_images,
     post_openrouter_images,
     resolve_color_theme,
     resolve_required_api_key,
@@ -560,6 +562,56 @@ class MediaEngine:
         )
 
     @staticmethod
+    async def _generate_image_custom_openai_direct(
+        prompt: str,
+        model: str,
+        api_key: Optional[str],
+        target_dir: str,
+        filename: Optional[str] = None,
+        provider_options: Optional[dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Generates an image via an OpenAI-compatible gateway's /images endpoint (e.g. ZvenoAI)."""
+        provider_options = provider_options or {}
+        image_format = provider_options.get("image_format", "jpeg")
+        image_quality = provider_options.get("image_quality", 85)
+
+        base_url = (provider_options.get("custom_openai_url") or "").strip().rstrip("/")
+        if not base_url:
+            raise RuntimeError(
+                "Missing custom OpenAI-compatible base URL. Set it in Administration "
+                "-> Intelligence -> Endpoints (Base URL), then save."
+            )
+
+        headers = openrouter_headers(api_key)
+        payload = build_openrouter_image_payload(model, prompt, provider_options)
+        post_fn = functools.partial(post_custom_openai_images, base_url)
+
+        logger.info(
+            "Calling custom OpenAI-compatible image endpoint (%s/images) for model %s",
+            base_url,
+            model,
+        )
+        response = await post_fn(headers, payload)
+
+        error_msg = ""
+        if response.status_code != 200:
+            response, error_msg = await retry_openrouter_minimal(
+                response, headers, payload, post_fn
+            )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Custom OpenAI-compatible image generation failed: {error_msg}")
+
+        image_url, b64_data = extract_openrouter_image(response.json())
+        if image_url:
+            return await MediaEngine._save_remote_image(
+                image_url, target_dir, filename, image_format, image_quality
+            )
+        return await MediaEngine._save_b64_image(
+            b64_data, target_dir, filename, image_format, image_quality
+        )
+
+    @staticmethod
     async def _generate_image_openrouter_chat_fallback(
         prompt: str,
         model: str,
@@ -654,6 +706,7 @@ class MediaEngine:
         direct_generators = {
             "comfyui": generate_comfyui_image,
             "openrouter": MediaEngine._generate_image_openrouter_direct,
+            "custom_openai": MediaEngine._generate_image_custom_openai_direct,
             "black_forest_labs": MediaEngine._generate_image_black_forest_labs_direct,
             "stable_diffusion": MediaEngine._generate_image_stable_diffusion_from_options,
         }
@@ -1003,6 +1056,39 @@ class MediaEngine:
             logger.exception("Error saving remote image")
             return None
 
+    # Base URL fields consulted for the custom OpenAI-compatible image provider,
+    # in priority order: the global legacy field first, then per-pass endpoints.
+    _CUSTOM_OPENAI_URL_KEYS = (
+        "custom_openai_url",
+        "complex_custom_openai_url",
+        "generator_custom_openai_url",
+        "small_custom_openai_url",
+        "play_agent_custom_openai_url",
+        "compression_custom_openai_url",
+    )
+
+    @staticmethod
+    def resolve_custom_openai_url(user_config: dict) -> str:
+        """First configured custom OpenAI-compatible base URL (global or per-pass)."""
+        for key in MediaEngine._CUSTOM_OPENAI_URL_KEYS:
+            custom_url = (user_config.get(key) or "").strip()
+            if custom_url:
+                return custom_url
+        return ""
+
+    @staticmethod
+    def _apply_custom_openai_url(options: dict[str, Any], user_config: dict) -> None:
+        """Forward the configured custom OpenAI-compatible base URL for image generation.
+
+        Falls back across the global field and per-pass endpoint URLs so image
+        generation also works when only per-pass endpoints are configured.
+        """
+        if options.get("custom_openai_url"):
+            return
+        custom_url = MediaEngine.resolve_custom_openai_url(user_config)
+        if custom_url:
+            options["custom_openai_url"] = custom_url
+
     @staticmethod
     async def generate_scene_image(
         prompt: str,
@@ -1064,6 +1150,8 @@ class MediaEngine:
             width, height = MediaEngine._resolve_sd_dimensions("SCENE", min_long_edge)
             options["width"] = width
             options["height"] = height
+
+        MediaEngine._apply_custom_openai_url(options, user_config)
 
         return await MediaEngine.generate_image(
             prompt=prompt,
@@ -1143,6 +1231,8 @@ class MediaEngine:
             width, height = MediaEngine._resolve_sd_dimensions(entity_type, min_long_edge)
             options["width"] = width
             options["height"] = height
+
+        MediaEngine._apply_custom_openai_url(options, user_config)
 
         return await MediaEngine.generate_image(
             prompt=prompt,
@@ -1239,6 +1329,8 @@ class MediaEngine:
             width, height = MediaEngine._resolve_sd_dimensions("COVER", min_long_edge)
             options["width"] = width
             options["height"] = height
+
+        MediaEngine._apply_custom_openai_url(options, user_config)
 
         return await MediaEngine.generate_image(
             prompt=prompt,

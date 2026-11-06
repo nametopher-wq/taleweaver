@@ -92,9 +92,40 @@ async def fetch_openai(
 async def fetch_openai_compatible(
     client: httpx.AsyncClient, api_key: Optional[str], base_url: str
 ) -> list[DiscoveredModel]:
-    """DeepSeek, Kimi and MiniMax only serve chat models from /models."""
-    payload = await _get_json(client, f"{base_url}/models", headers=_bearer(api_key))
+    """DeepSeek, Kimi and MiniMax only serve chat models from /models.
+
+    Gateways like ZvenoAI additionally expose image models via the vendor-specific
+    `?model_type=image_generation` filter; those are merged in when supported.
+    """
+    headers = _bearer(api_key)
+    payload = await _get_json(client, f"{base_url}/models", headers=headers)
     models = (_model(i.get("id"), i.get("name") or i.get("id"), LLM) for i in _items(payload))
+    found = [m for m in models if m]
+    found.extend(await _fetch_gateway_image_models(client, headers, base_url))
+    return found
+
+
+async def _fetch_gateway_image_models(
+    client: httpx.AsyncClient, headers: dict[str, str], base_url: str
+) -> list[DiscoveredModel]:
+    """Fetch image models from gateways that list them separately (e.g. ZvenoAI).
+
+    Gateways without this extension reject or ignore the parameter; both are fine.
+    """
+    try:
+        payload = await _get_json(
+            client,
+            f"{base_url}/models",
+            headers=headers,
+            params={"model_type": "image_generation"},
+        )
+    except DiscoveryError:
+        return []
+    models = (
+        _model(i.get("id"), i.get("name") or i.get("id"), IMAGE)
+        for i in _items(payload)
+        if i.get("model_type") == "image_generation"
+    )
     return [m for m in models if m]
 
 

@@ -129,6 +129,7 @@ Instead of a static, predefined story, the AI acts as an intelligent, omniscient
 * **Import/Export:** Adventures can be backed up or shared.
 * **Update Badges:** Installed adventures show an **Update** badge when a newer version is available, either as a file in `/adventures` or in the Adventure Library (matched by the adventure's stable ID). Updating keeps existing game sessions.
 * **Offline Image Generation:** Local providers are supported, including **Ollama**, **Stable Diffusion via Automatic1111/Forge API**, and [**ComfyUI (Experimental)**](docs/comfyui/README.md) with selectable checkpoints and standard SD 1.5/SDXL workflows.
+* **Custom Image Gateways:** The **OpenAI-Compatible (Custom)** image provider calls any gateway that implements the unified `/v1/images` contract (for example ZvenoAI or OpenRouter), reusing the API key configured under Administration → Intelligence → Endpoints. The gateway Base URL is resolved from the global custom endpoint setting, falling back to any per-pass OpenAI-Compatible endpoint URL (Pass 2 Narrative first, then Worldbuilder, Pass 1, Play Agent, History Compression).
 
 ### Recent Feature Highlights
 
@@ -229,7 +230,7 @@ TaleWeaver uses an adapter layer ([LiteLLM](https://github.com/BerriAI/litellm))
 | **Narrative (Pass 2)** | DeepSeek v4 Pro, GPT-6 Luna Pro, Claude 4.5 Sonnet | OpenAI, Anthropic, OpenRouter, DeepSeek, OpenAI-compatible APIs | Rich, atmospheric prose adapting to player choices and mood |
 | **Text-to-Speech (TTS)** | Gemini 3.5 Flash TTS, ElevenLabs | Google Gemini, ElevenLabs | High-fidelity voice narration; feels like a live audiobook |
 | **Speech-to-Text (STT)**| faster-whisper (Whisper Base / Small / Medium, CPU int8) | Local Whisper (background thread) | Hands-free microphone input with Push-to-Talk hotkeys |
-| **Visual Scene Art** | FLUX, Stable Diffusion (A1111 / Forge), ComfyUI (Experimental), Ollama | Local SD WebUI, Ollama, Cloud APIs | Contextual illustrations for scenes, items, and NPCs |
+| **Visual Scene Art** | FLUX, Stable Diffusion (A1111 / Forge), ComfyUI (Experimental), Ollama | Local SD WebUI, Ollama, Cloud APIs, OpenAI-compatible custom gateways | Contextual illustrations for scenes, items, and NPCs |
 
 **OpenAI-Compatible API** connects hosted gateways and self-hosted servers through a configurable Chat Completions base URL, optional encrypted key and exact model ID. It is available for all five LLM roles, including the play agent and history compression. See the [configuration guide](docs/custom-openai-compatible.md) for model discovery, structured-output modes and local networking requirements. Endpoint and model compatibility must be checked with your configuration.
 

@@ -10,6 +10,7 @@ import contextlib
 import logging
 import re
 import time
+from collections.abc import Callable
 from typing import Any, Optional
 
 import requests
@@ -295,11 +296,11 @@ def extract_chat_image_payload(message: Any) -> tuple[Optional[str], Optional[st
 
 
 def extract_openrouter_image(result: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-    """Return (remote_url, b64_or_data_url) from an OpenRouter /images response."""
+    """Return (remote_url, b64_or_data_url) from an OpenAI-compatible /images response."""
     data_list = result.get("data", [])
     if not data_list or not isinstance(data_list, list):
-        logger.error("OpenRouter response missing 'data' list: %s", result)
-        raise RuntimeError("OpenRouter response did not contain image data.")
+        logger.error("/images response missing 'data' list: %s", result)
+        raise RuntimeError("Image provider response did not contain image data.")
 
     first_img = data_list[0]
     if isinstance(first_img, dict):
@@ -310,7 +311,7 @@ def extract_openrouter_image(result: dict[str, Any]) -> tuple[Optional[str], Opt
         if image_url:
             return split_data_url(image_url)
 
-    raise RuntimeError("No valid image data or URL found in OpenRouter response.")
+    raise RuntimeError("No valid image data or URL found in image provider response.")
 
 
 # --- OpenRouter HTTP ----------------------------------------------------------------
@@ -400,16 +401,23 @@ async def post_openrouter_images(headers: dict[str, str], payload: dict[str, Any
     )
 
 
+PostImagesFn = Callable[[dict[str, str], dict[str, Any]], Any]  # async post helper
+
+
 async def retry_openrouter_minimal(
-    response: Any, headers: dict[str, str], payload: dict[str, Any]
+    response: Any,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    post_fn: Optional[PostImagesFn] = None,
 ) -> tuple[Any, str]:
     """Log a failed /images call and, on a size/aspect rejection, retry with model + prompt only.
 
     Returns the response to continue with (the retry when it succeeded) and the latest error text.
     """
+    post = post_fn if post_fn is not None else post_openrouter_images
     error_msg = openrouter_error_message(response)
     logger.warning(
-        "OpenRouter /api/v1/images endpoint returned error (%s): %s",
+        "OpenAI-compatible /images endpoint returned error (%s): %s",
         response.status_code,
         error_msg,
     )
@@ -419,14 +427,28 @@ async def retry_openrouter_minimal(
         return response, error_msg
 
     logger.info(
-        "Retrying OpenRouter /api/v1/images with minimal payload due to parameter rejection: %s",
+        "Retrying /images with minimal payload due to parameter rejection: %s",
         error_msg,
     )
     retry_payload = {"model": payload["model"], "prompt": payload["prompt"]}
-    retry_resp = await post_openrouter_images(headers, retry_payload)
+    retry_resp = await post(headers, retry_payload)
     if retry_resp.status_code == 200:
         return retry_resp, error_msg
     return response, _retry_error_message(retry_resp)
+
+
+async def post_custom_openai_images(
+    base_url: str, headers: dict[str, str], payload: dict[str, Any]
+) -> Any:
+    """POST to an OpenAI-compatible gateway's /images endpoint (e.g. ZvenoAI, OpenRouter)."""
+    url = f"{base_url.rstrip('/')}/images"
+    return await asyncio.to_thread(
+        requests.post,
+        url,
+        headers=headers,
+        json=payload,
+        timeout=settings.VISUAL_TIMEOUT,
+    )
 
 
 # --- Black Forest Labs polling ------------------------------------------------------

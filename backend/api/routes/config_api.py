@@ -468,7 +468,11 @@ def _is_t2i_configured(user: User, db_keys: dict) -> bool:
     def has_key(provider):
         if provider in ("ollama", "stable_diffusion", "comfyui"):
             return True
-        return bool(settings.get_env_api_key(provider)) or (db_keys and provider in db_keys)
+        has_api_key = bool(settings.get_env_api_key(provider)) or (db_keys and provider in db_keys)
+        if provider == "custom_openai":
+            custom_url = MediaEngine.resolve_custom_openai_url(user.llm_settings or {})
+            return has_api_key and bool(custom_url)
+        return has_api_key
 
     return has_key(simple_provider) and bool(simple_model)
 
@@ -1060,6 +1064,7 @@ class TestVisionPayload(ComfyTestOptions):
     provider: str
     ollama_url: Optional[str] = None
     stable_diffusion_url: Optional[str] = None
+    custom_openai_url: Optional[str] = None
     steps: Optional[int] = None
     cfg_scale: Optional[float] = None
     sampler_name: Optional[str] = None
@@ -1095,7 +1100,13 @@ def _build_vision_provider_options(payload: "TestVisionPayload", provider_key: s
     options: dict[str, Any] = {}
     if provider_key == "comfyui":
         options.update(ComfyTestOptions.model_validate(payload.model_dump()).model_dump())
-    for key in ("ollama_url", "stable_diffusion_url", "sampler_name", "scheduler"):
+    for key in (
+        "ollama_url",
+        "stable_diffusion_url",
+        "custom_openai_url",
+        "sampler_name",
+        "scheduler",
+    ):
         if getattr(payload, key):
             options[key] = getattr(payload, key)
     for key in ("steps", "cfg_scale"):
@@ -1127,6 +1138,8 @@ async def test_vision_connection(
     """Tests the connection to an image provider by generating a wizard portrait."""
     user = await _resolve_global_settings_owner(db, current_user)
     provider_key = payload.provider.lower()
+    if provider_key == "custom_openai" and not payload.custom_openai_url:
+        payload.custom_openai_url = (user.llm_settings or {}).get("custom_openai_url") or None
     api_key, error_response = _resolve_vision_api_key(user, provider_key, payload.provider)
     if error_response:
         return error_response
@@ -1288,6 +1301,9 @@ async def generate_catalog_image(
                 base_prompt += f" Context: {payload.description}"
             base_prompt += " High quality, professional digital art, no text."
 
+        provider_options = dict(t2i)
+        MediaEngine._apply_custom_openai_url(provider_options, user.llm_settings or {})
+
         img_url = await MediaEngine.generate_image(
             prompt=base_prompt,
             model=model,
@@ -1295,7 +1311,7 @@ async def generate_catalog_image(
             provider=provider,
             target_dir=catalog_dir,
             filename=asset_filename(safe_target_id, t2i.get("image_format")),
-            provider_options=t2i,
+            provider_options=provider_options,
         )
 
         logger.info("Catalog generate result for '%s': img_url=%r", payload.target_id, img_url)

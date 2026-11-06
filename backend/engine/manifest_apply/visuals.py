@@ -56,7 +56,7 @@ async def generate_image(
     ctx.image_counters["attempts"] += 1
     try:
         image_url = await asyncio.wait_for(factory(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("%s timed out after %ss", failure_label, timeout)
         return None
     except Exception as exc:
@@ -84,9 +84,11 @@ async def placeholder_image(
 def t2i_config(ctx: ApplyContext) -> tuple[dict, dict]:
     """Returns the (user_config, api_keys) pair every MediaEngine call expects."""
     user = ctx.user
-    return {"t2i_settings": user.t2i_settings if user else None}, dict(
-        (user.encrypted_api_keys if user else None) or {}
-    )
+    llm_settings = (user.llm_settings if user else None) or {}
+    return {
+        "t2i_settings": user.t2i_settings if user else None,
+        **llm_settings,
+    }, dict((user.encrypted_api_keys if user else None) or {})
 
 
 def uses_advanced_model(ctx: ApplyContext, setting: str, default: str) -> bool:
