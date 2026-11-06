@@ -32,6 +32,7 @@ Verified:
 - The isolated image feature and integration trees matched at `bf2ec6f8`.
 - PowerShell bootstrap passed twice on the original checkout without changing local files or exclusions.
 - Bash bootstrap passed on a clean GitHub clone and passed a second idempotence run; the test clone was removed.
+- Project-scoped agent instructions were discovered by Kimi Code on both checkouts; no global `AGENTS.md` remained or was created during bootstrap.
 
 Not verified:
 
