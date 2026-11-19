@@ -54,13 +54,13 @@ Verification recorded on 2026-11-19:
 - Real backend health and authenticated settings calls returned 200; custom image provider registration was confirmed.
 - Mocked custom `/images` dispatch, authorization, URL fallback, and empty-effective-key policy preservation passed.
 - Database backup, migration to `cfa8f8fd4b9e`, integrity, row counts, and semantic preservation of server settings were verified.
+- Full Poetry dev installation succeeded through the TLS-inspecting proxy using Windows trust store; 52 smoke tests passed in both the Poetry environment and the local `venv`.
 
 Known limitations:
 
 - Gemini image models that do not support the gateway's `/images` contract require chat completions; that fallback is not implemented.
 - Live ZvenoAI image generation was not retested during synchronization.
 - Provider credentials and endpoint configuration remain in local application state and are not part of the feature branch.
-- Poetry dev-dependency installation could not reach PyPI; runtime dependencies were unchanged and `poetry install --only main` succeeded.
 
 PR: none.
 

@@ -33,6 +33,7 @@ Verified:
 - Database integrity and row counts were preserved; all migrated server settings semantically matched the source admin settings.
 - Pre-migration backup: `data/backups/taleweaver-pre-sync-20261119-090900.db`.
 - Incident backup before removing test contamination: `data/backups/taleweaver-post-test-contamination-20261119-091219.db`.
+- Full Poetry dev installation succeeded through the TLS-inspecting proxy using Windows trust store; 52 smoke tests passed in both Python environments.
 
 Known upstream issues not changed by the local feature:
 
@@ -44,7 +45,6 @@ Known upstream issues not changed by the local feature:
 Not verified:
 
 - Live ZvenoAI image generation was not retested.
-- Poetry dev-dependency installation could not reach PyPI. Runtime dependencies were unchanged and `poetry install --only main` succeeded.
 
 Git notes:
 
