@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import zipfile
+from copy import deepcopy
 from typing import Any
 
 from fastapi.encoders import jsonable_encoder
@@ -121,6 +122,11 @@ _NPC_ENTITY_KEYS = {
     "on_interact_text",
     "on_receive_item_script",
     "on_receive_item_text",
+    "on_recruit_success_script",
+    "on_recruit_success_text",
+    "on_recruit_failure_script",
+    "on_recruit_failure_text",
+    "reveal_guard_expression",
 }
 
 _SYSTEM_ENTITY_KEYS = {"pk", "session_id", "created_at", "updated_at", "template_id"}
@@ -307,6 +313,8 @@ def _normalize_exported_object_metadata(filtered: dict[str, Any]) -> None:
         metadata.pop("on_read_text", None)
 
     _export_container_metadata(filtered, metadata, item_type in {"CONTAINER", "CONTAINER_SWITCH"})
+    if metadata.pop("quest_item", None) is True:
+        filtered["quest_item"] = True
 
     if item_type == "CONSTRUCTABLE":
         for recipe_key in ("result_item_ids", "kept_ingredients"):
@@ -342,6 +350,11 @@ def _normalize_exported_npc_metadata(filtered: dict[str, Any]) -> None:
         "on_interact_text",
         "on_receive_item_script",
         "on_receive_item_text",
+        "on_recruit_success_script",
+        "on_recruit_success_text",
+        "on_recruit_failure_script",
+        "on_recruit_failure_text",
+        "reveal_guard_expression",
     ):
         val = metadata.pop(script_key, None)
         if val:
@@ -479,6 +492,8 @@ def _build_adventure_section(adv: AdventureTemplate) -> dict[str, Any]:
         "original_prompt": adv.original_prompt,
         "image_url": adv.image_url,
         "rule_enforcement_mode": adv.rule_enforcement_mode,
+        "sequence_progression_mode": adv.sequence_progression_mode,
+        "dynamic_generation": adv.dynamic_generation,
         "time_per_turn": adv.time_per_turn,
         "pacing_minutes": adv.pacing_minutes,
         "max_time_per_turn": adv.max_time_per_turn,
@@ -487,6 +502,9 @@ def _build_adventure_section(adv: AdventureTemplate) -> dict[str, Any]:
         "clock_enabled": adv.clock_enabled,
         "selected_tone": adv.selected_tone,
         "narrator_voice": adv.narrator_voice,
+        "audio_tracks": deepcopy(adv.audio_tracks or []),
+        "audio_enabled": bool(getattr(adv, "audio_enabled", True)),
+        "title_track_id": adv.title_track_id,
         "ui_theme": adv.ui_theme,
         "selected_image_styles": adv.selected_image_styles,
         "generate_scene_images": adv.generate_scene_images,
@@ -608,6 +626,10 @@ def _localize_manifest_images(
         record["image_url"] = _localize_asset_path(
             record.get("image_url"), adventure_dir, asset_mapping
         )
+    # The audio library's files travel as assets/ files too.
+    for track in adventure.get("audio_tracks") or []:
+        if isinstance(track, dict) and track.get("url"):
+            track["url"] = _localize_asset_path(track["url"], adventure_dir, asset_mapping)
 
 
 class AdventureExporter:
@@ -670,6 +692,7 @@ class AdventureExporter:
             "sequences": adv.sequences or [],
             "scripts": (adv.original_manifest or {}).get("scripts", []),
             "init_script": adv.init_script or "",
+            "dynamic_generation": adv.dynamic_generation,
         }
         # Fork-specific data is passed through untouched (docs/specs/adventure_format.md 2.10).
         extensions = manifest_extensions(adv.original_manifest)

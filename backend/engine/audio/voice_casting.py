@@ -1,10 +1,12 @@
-"""Deterministic voice casting: gives every NPC a fitting ElevenLabs voice that differs from its neighbours.
+"""Deterministic voice casting: gives every NPC a fitting voice that differs from its neighbours.
 
-Per-character voices are an ElevenLabs feature; with Gemini TTS everything is spoken in the
-narrator voice. Voices come from the curated voice list (see ``elevenlabs_voices``) and are picked by
-the gender implied in the NPC's description, avoiding the narrator voice and voices already used by
-other NPCs. The choice depends only on the NPC id and the order of the NPCs, so the same adventure
-always sounds the same. An NPC whose stored voice was removed from the list uses the narrator voice.
+Voices come from the curated voice list (see ``elevenlabs_voices``), whatever the speech provider:
+ElevenLabs speaks the list ids, Google TTS and the OpenAI-compatible server the voices the admin
+mapped to them (``voice_provider_map``; unmapped voices fall back to the narrator voice). Voices are
+picked by the gender implied in the NPC's description, avoiding voices that sound like the
+narrator and voices already used by other NPCs. The choice depends only on the NPC id and the order
+of the NPCs, so the same adventure always sounds the same. An NPC whose stored voice was removed
+from the list uses the narrator voice.
 """
 
 from __future__ import annotations
@@ -17,12 +19,12 @@ from typing import Any, Final, NamedTuple, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.core.config import settings
-from backend.core.security import encryption_util
+from backend.core.api_keys import resolve_api_key
+from backend.core.global_settings import SettingsSource, read_server_settings
 from backend.engine.audio.elevenlabs_voices import VoiceOption, custom_voice_id, load_voice_catalog
+from backend.engine.audio.voice_provider_map import effective_voice_map, voices_sounding_like
 from backend.models.avatar import Avatar
 from backend.models.game_session import GameSession
-from backend.models.user import User
 
 NPC_VOICE_PROVIDER: Final = "elevenlabs"
 # Key of the protagonist in the voice metadata (NPC ids are upper-case slugs, never this).
@@ -50,10 +52,8 @@ class VoiceSetup(NamedTuple):
     provider: str
     narrator_voice: str
     voices: list[VoiceOption]
-
-    @property
-    def supports_npc_voices(self) -> bool:
-        return self.provider == NPC_VOICE_PROVIDER
+    # List voice ids the provider speaks with the narrator voice (never cast to characters).
+    reserved: tuple[str, ...] = ()
 
 
 def infer_voice_gender(text: str) -> Optional[str]:
@@ -110,36 +110,34 @@ def cast_voices(
 def cast_npc_voices(
     setup: VoiceSetup, candidates: Sequence[CastingCandidate]
 ) -> dict[str, Optional[str]]:
-    """Per-NPC voices for the active provider; ``None`` everywhere when it has no NPC voices."""
-    if not setup.supports_npc_voices:
-        return {c.npc_id: None for c in candidates}
-    return cast_voices(candidates, setup.voices, reserved=[setup.narrator_voice])
+    """Per-NPC list voices (``None`` = narrator voice), avoiding the narrator's own voice."""
+    return cast_voices(candidates, setup.voices, reserved=setup.reserved)
 
 
-async def load_tts_owner(db: AsyncSession) -> Optional[User]:
-    """TTS settings are global and owned by the (first) admin."""
-    return (await db.execute(select(User).where(User.role == "admin").limit(1))).scalars().first()
+def provider_api_key(provider: str, source: Optional[SettingsSource]) -> Optional[str]:
+    """The key for ``provider`` per the key policy (personal, env or stored server key).
+
+    ``source`` is a user with the settings overlay (effective keys) or the server row.
+    Raises ``PersonalKeyRequiredError`` when the provider is unavailable for that user.
+    """
+    return resolve_api_key(source.encrypted_api_keys if source else None, provider)
 
 
-def provider_api_key(provider: str, owner: Optional[User]) -> Optional[str]:
-    """The provider key from the environment, else the owner's stored (encrypted) key."""
-    api_key = settings.get_env_api_key(provider)
-    if api_key:
-        return api_key
-    encrypted = ((owner.encrypted_api_keys if owner else None) or {}).get(provider)
-    return encryption_util.decrypt_key(encrypted) if encrypted else None
+def _narrator_voice(provider: str, tts_settings: dict[str, Any]) -> str:
+    keys = {NPC_VOICE_PROVIDER: "elevenlabs_voice_id", "custom_openai": "custom_openai_voice"}
+    return str(tts_settings.get(keys.get(provider, "selected_voice")) or "")
 
 
 async def resolve_voice_setup(db: AsyncSession) -> VoiceSetup:
-    """Active TTS provider, narrator voice and (for ElevenLabs) the voice list."""
-    owner = await load_tts_owner(db)
-    tts_settings = (owner.tts_settings if owner else None) or {}
+    """Active TTS provider, its narrator voice, the voice list and the voices to keep free."""
+    server = await read_server_settings(db)
+    tts_settings = server.tts_settings or {}
     provider = str(tts_settings.get("provider") or "google").lower()
-    if provider != NPC_VOICE_PROVIDER:
-        return VoiceSetup(provider, str(tts_settings.get("selected_voice") or ""), [])
-    return VoiceSetup(
-        provider, str(tts_settings.get("elevenlabs_voice_id") or ""), load_voice_catalog()
-    )
+    narrator = _narrator_voice(provider, tts_settings)
+    voices = load_voice_catalog()
+    voice_map = effective_voice_map(server.voice_provider_map, voices)
+    reserved = tuple(voices_sounding_like(voice_map, provider, narrator))
+    return VoiceSetup(provider, narrator, voices, reserved)
 
 
 async def load_protagonist(

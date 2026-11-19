@@ -2,11 +2,19 @@ import { reactive } from 'vue'
 import { api } from '@/composables/useApi'
 import { authState } from '@/store/auth'
 
+export interface MissingPersonalKey {
+  id: string
+  reason: 'missing' | 'disabled'
+  message: string
+}
+
 export const configState = reactive({
   appVersion: '0.0.0-loading' as string,
   isLoaded: false,
   hasLlmConfig: false,
   hasT2iConfig: false,
+  /** Chat passes the player cannot run until they add an own key (or the admin enables it). */
+  missingPersonalKeys: [] as MissingPersonalKey[],
   isBackendReachable: true,
   isTtsEnabled: false,
   lastErrorMessage: '' as string
@@ -47,6 +55,7 @@ export async function refreshConfig() {
     
     configState.hasLlmConfig = !!data.is_llm_configured
     configState.hasT2iConfig = !!data.is_t2i_configured
+    configState.missingPersonalKeys = data.missing_personal_keys || []
     const tts = data.tts_settings as any
     configState.isTtsEnabled = !!tts?.enabled
     
@@ -55,12 +64,21 @@ export async function refreshConfig() {
     if (tts) {
       // The provider may have changed: find out again whether it streams.
       audioService.resetProviderCapabilities()
+      const provider = String(tts.provider || 'google')
+      audioService.setProvider(provider)
+      const { setBrowserVoicePreferences } = await import('@/services/browserTts')
+      setBrowserVoicePreferences({
+        narrator: typeof tts.browser_voice === 'string' ? tts.browser_voice : '',
+        characters: Array.isArray(tts.browser_character_voices) ? tts.browser_character_voices : [],
+      })
       if (typeof tts.speech_rate === 'number') {
         audioService.speechRate.value = tts.speech_rate
       }
       // Speech starts on its own when TTS is usable (enabled + provider key) and the admin
       // has "start automatically" on; players can still switch it off.
-      const ttsConfigured = !!tts.enabled && !!data.keys?.[String(tts.provider || 'google')]
+      // Browser speech and OpenAI-compatible speech servers (key optional) need no vault key.
+      const keyless = provider === 'browser' || provider === 'custom_openai'
+      const ttsConfigured = !!tts.enabled && (keyless || !!data.keys?.[provider])
       audioService.applyAutoSpeechDefault(ttsConfigured && tts.auto_speak !== false)
     }
     

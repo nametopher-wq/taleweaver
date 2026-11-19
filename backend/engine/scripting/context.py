@@ -7,14 +7,18 @@ within a declarative ScriptChangeset.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from backend.engine.scripting.audio_proxy import AudioProxy
 from backend.engine.scripting.dialog import DialogProxy
 from backend.engine.scripting.gm_directions import clean_direction, queue_direction
+from backend.engine.scripting.image_proxy import ImageGenerator, ImageProxy
 from backend.engine.scripting.item_ops import ItemMover
 from backend.engine.scripting.item_proxies import ItemHolderMixin, ItemManagerMixin, ItemOpsMixin
 from backend.engine.scripting.item_transfer import inventory_entry, take_from_inventory
@@ -25,10 +29,12 @@ from backend.engine.scripting.npc_combat_group import (
     NPCCombatGroupMixin,
 )
 from backend.engine.scripting.npc_directions import NPCDirectionManagerMixin, NPCDirectionMixin
+from backend.engine.scripting.npc_memory_proxy import NPCMemoryManagerMixin, NPCMemoryMixin
 from backend.engine.scripting.npc_persona import NPCPersonaManagerMixin, NPCPersonaMixin
 from backend.engine.scripting.npc_visibility import NPCVisibilityManagerMixin, NPCVisibilityMixin
 from backend.engine.scripting.npc_vitals import NPCVitalsManagerMixin, NPCVitalsMixin
-from backend.engine.scripting.player_inventory import PlayerInventoryMixin
+from backend.engine.scripting.party_proxy import PartyProxy
+from backend.engine.scripting.player_inventory import InventoryProxy, PlayerInventoryMixin
 from backend.engine.scripting.switch_proxy import SwitchesProxy, SwitchProxy
 from backend.engine.scripting.time_proxy import TimeProxy, default_clock_view
 
@@ -90,6 +96,7 @@ class ScriptChangeset:
     player_status_effects_remove: list[str] = field(default_factory=list)
 
     teleport_scene_id: Optional[str] = None
+    teleport_dynamic_request: Optional[dict[str, Any]] = None
     entity_movements: list[dict[str, Any]] = field(default_factory=list)
     entity_updates: list[dict[str, Any]] = field(default_factory=list)
     exit_updates: list[dict[str, Any]] = field(default_factory=list)
@@ -127,6 +134,16 @@ class ScriptChangeset:
     save_requests: list[str] = field(default_factory=list)
     # Ordered tw.time operations, replayed by game_clock.apply_clock_ops.
     clock_ops: list[dict[str, Any]] = field(default_factory=list)
+    # tw.story.skip_narration(): the next Pass 2 produces no narration (narration_skip.py).
+    skip_narration: bool = False
+    # Ordered tw.audio operations, replayed by audio_state.apply_audio_ops.
+    audio_ops: list[dict[str, Any]] = field(default_factory=list)
+    # Ordered tw.party operations, replayed by party_ops.apply_party_ops.
+    party_ops: list[dict[str, Any]] = field(default_factory=list)
+    # tw.game.set_respawn_point: new revival point ("" = back to the start scene).
+    respawn_point: Optional[str] = None
+    # Ordered tw.npcs memory operations, replayed by npc_memory.apply_npc_memory_ops.
+    npc_memory_ops: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not isinstance(self.narrative_messages, _TrackingList):
@@ -153,6 +170,7 @@ class ScriptChangeset:
             or self.player_status_effects_add
             or self.player_status_effects_remove
             or self.teleport_scene_id
+            or self.teleport_dynamic_request
             or self.entity_movements
             or self.entity_updates
             or self.exit_updates
@@ -182,6 +200,11 @@ class ScriptChangeset:
             or self.pending_dialog
             or self.cloned_entities
             or self.clock_ops
+            or self.audio_ops
+            or self.party_ops
+            or self.respawn_point is not None
+            or self.npc_memory_ops
+            or self.skip_narration
         )
 
 
@@ -321,7 +344,72 @@ class SceneProxy:
         return [obj for obj in self._objects_mgr.all() if obj.current_scene_id == self.id]
 
     def teleport(self, target_scene_id: str) -> None:
+        self._changeset.teleport_dynamic_request = None
         self._changeset.teleport_scene_id = target_scene_id
+
+    def teleport_dynamic(
+        self,
+        theme_or_zone_id: str = "",
+        theme: Optional[str] = None,
+        *,
+        zone_id: Optional[str] = None,
+        max_depth: Optional[int] = None,
+        danger_level: Optional[str] = None,
+        max_npcs: Optional[int] = None,
+        audio_mode: Optional[str] = None,
+        cul_de_sac: Optional[bool] = None,
+        instructions: Optional[str] = None,
+        instructions_scope: Optional[str] = None,
+        cluster_consistency: Optional[bool] = None,
+        return_exit: bool = True,
+        label: str = "Teleporter",
+        fresh: bool = False,
+    ) -> str:
+        """Schedule a runtime transition into a generated dynamic scene and return its scene ID."""
+        from backend.engine.world.dynamic_scene_schemas import build_dynamic_placeholder_scene_id
+
+        origin_scene_id = self._current_scene_id
+        if theme is not None:
+            resolved_zone_id = str(zone_id or theme_or_zone_id or label or "teleporter").strip()
+            resolved_theme = str(theme).strip()
+            reference_key = str(zone_id or theme_or_zone_id or "").strip()
+        elif zone_id is not None:
+            resolved_zone_id = str(zone_id).strip() or "teleporter"
+            resolved_theme = str(theme_or_zone_id or "").strip()
+            reference_key = resolved_zone_id
+        else:
+            raw_arg = str(theme_or_zone_id or "").strip()
+            resolved_zone_id = str(label or raw_arg or "teleporter").strip()
+            resolved_theme = raw_arg
+            reference_key = raw_arg
+
+        if fresh:
+            suffix = uuid.uuid4().hex[:4]
+        else:
+            digest_src = f"{origin_scene_id}:{resolved_zone_id}:{resolved_theme}".encode()
+            suffix = hashlib.sha256(digest_src).hexdigest()[:4]
+
+        target_scene_id = build_dynamic_placeholder_scene_id(resolved_zone_id, 1, 1, suffix=suffix)
+        self._changeset.teleport_scene_id = target_scene_id
+        self._changeset.teleport_dynamic_request = {
+            "origin_scene_id": origin_scene_id,
+            "target_scene_id": target_scene_id,
+            "reference_key": reference_key,
+            "zone_id": str(zone_id).strip() if zone_id is not None else "",
+            "theme": resolved_theme,
+            "max_depth": max_depth,
+            "danger_level": danger_level,
+            "max_npcs": max_npcs,
+            "audio_mode": audio_mode,
+            "cul_de_sac": cul_de_sac,
+            "instructions": instructions,
+            "instructions_scope": instructions_scope,
+            "cluster_consistency": cluster_consistency,
+            "return_exit": bool(return_exit),
+            "label": str(label or "Teleporter").strip()[:100] or "Teleporter",
+            "fresh": bool(fresh),
+        }
+        return target_scene_id
 
     def get_attribute(self, attr_name: str, default: Any = None) -> Any:
         k = f"__scene_attr_{self.id}_{attr_name}"
@@ -485,6 +573,7 @@ class NPCProxy(
     NPCDirectionMixin,
     NPCVitalsMixin,
     NPCVisibilityMixin,
+    NPCMemoryMixin,
     ItemHolderMixin,
 ):
     """Safe proxy for Non-Player Characters."""
@@ -1090,6 +1179,7 @@ class NPCManagerProxy(
     NPCDirectionManagerMixin,
     NPCVitalsManagerMixin,
     NPCVisibilityManagerMixin,
+    NPCMemoryManagerMixin,
     EntityManagerProxy,
 ):
     """``tw.npcs``: entity access plus the NPC persona, directed-speech and vitals shortcuts."""
@@ -1145,15 +1235,38 @@ class VarsProxy:
 
     def get(self, key: str, default: Any = None) -> Any:
         if key in self._changeset.var_updates:
-            return self._changeset.var_updates[key]
+            val = self._changeset.var_updates[key]
+            return default if val is None else val
         if key in self._vars:
-            return self._vars[key]
+            val = self._vars[key]
+            return default if val is None else val
         if key in self._story_flags:
-            return self._story_flags[key]
+            val = self._story_flags[key]
+            return default if val is None else val
         return default
 
     def set(self, key: str, val: Any) -> None:
         self._changeset.var_updates[key] = val
+
+    def has(self, key: str) -> bool:
+        if key in self._changeset.var_updates:
+            return self._changeset.var_updates[key] is not None
+        if key in self._vars:
+            return self._vars[key] is not None
+        if key in self._story_flags:
+            return self._story_flags[key] is not None
+        return False
+
+    def delete(self, key: str) -> None:
+        self.set(key, None)
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        val = self.get(key, default)
+        self.delete(key)
+        return val
+
+    def __contains__(self, key: str) -> bool:
+        return self.has(key)
 
     def __getitem__(self, key: str) -> Any:
         return self.get(key)
@@ -1161,13 +1274,22 @@ class VarsProxy:
     def __setitem__(self, key: str, val: Any) -> None:
         self.set(key, val)
 
+    def __delitem__(self, key: str) -> None:
+        self.delete(key)
+
 
 class StoryProxy:
     """Safe proxy for narrative messages and action rejections."""
 
-    def __init__(self, changeset: ScriptChangeset, is_debug_enabled: bool = False):
+    def __init__(
+        self,
+        changeset: ScriptChangeset,
+        is_debug_enabled: bool = False,
+        image: Optional[ImageProxy] = None,
+    ):
         self._changeset = changeset
         self._is_debug_enabled = is_debug_enabled
+        self._image = image or ImageProxy(None, changeset, is_debug_enabled=is_debug_enabled)
 
     def narrate(self, message: str) -> None:
         """Emits GM narration as if told by the Game Master."""
@@ -1190,6 +1312,21 @@ class StoryProxy:
         """Emits a system notification message."""
         self._changeset.system_messages.append(str(message).strip())
 
+    def show_image(self, image_url: str, caption: str = "") -> None:
+        """Shortcut for tw.image.show(). Posts an image to the story feed."""
+        self._image.show(image_url, caption)
+
+    def generate_image(
+        self,
+        prompt: str,
+        model: str = "simple",
+        apply_style: bool = True,
+        show_in_chat: bool = True,
+        caption: str = "",
+    ) -> str:
+        """Shortcut for tw.image.generate(). Returns the image URL or ""."""
+        return self._image.generate(prompt, model, apply_style, show_in_chat, caption)
+
     def system(self, message: str) -> None:
         """Alias for system_message()."""
         self.system_message(message)
@@ -1201,6 +1338,14 @@ class StoryProxy:
         with ``after_args`` as keyword arguments.
         """
         queue_direction(self._changeset, clean_direction(instruction), after, after_args)
+
+    def skip_narration(self) -> None:
+        """No automatic GM narration (and no TTS for it) in the next narration pass.
+
+        E.g. while an audio track plays that must not be talked over. Script messages
+        (``narrate``, ``system``) are still shown.
+        """
+        self._changeset.skip_narration = True
 
     def debug(self, *args: Any, sep: str = " ") -> None:
         """Emits an in-game debug notification if debug mode is active."""
@@ -1277,12 +1422,20 @@ class MemoriesProxy:
     def __init__(self, changeset: ScriptChangeset):
         self._changeset = changeset
 
-    def add(self, description: str, scope: str = "global", emotion: str = "neutral") -> None:
+    def add(
+        self,
+        description: str,
+        scope: str = "global",
+        emotion: str = "neutral",
+        npc_id: Optional[str] = None,
+    ) -> None:
+        """Records a lasting consequence; with ``npc_id`` it is only shown while that NPC is present."""
         self._changeset.new_memories.append(
             {
                 "description": str(description).strip(),
                 "scope": scope if scope in ("local", "global") else "global",
                 "emotion": emotion if emotion in ("positive", "negative", "neutral") else "neutral",
+                "npc_id": str(npc_id).strip().upper() if npc_id else None,
             }
         )
 
@@ -1295,10 +1448,30 @@ class GameProxy:
         changeset: ScriptChangeset,
         in_game_time: int = 0,
         clock: Optional[TimeProxy] = None,
+        respawn: Optional[dict[str, Any]] = None,
     ):
         self._changeset = changeset
         self.in_game_time = in_game_time
         self._clock = clock
+        record = respawn if isinstance(respawn, dict) else {}
+        self._respawn_point = record.get("point") or None
+        self._respawns = int(record.get("count") or 0)
+
+    @property
+    def respawn_point(self) -> Optional[str]:
+        """Scene the protagonist wakes up in after falling to 0 HP (None = the start scene)."""
+        if self._changeset.respawn_point is not None:
+            return self._changeset.respawn_point or None
+        return self._respawn_point
+
+    @property
+    def respawns(self) -> int:
+        """How often the protagonist has been revived in this session (respawn mode)."""
+        return self._respawns
+
+    def set_respawn_point(self, scene_id: Optional[str] = None) -> None:
+        """Sets the revival point (respawn mode); None or "" falls back to the start scene."""
+        self._changeset.respawn_point = str(scene_id or "").strip().upper()
 
     @property
     def time(self) -> int:
@@ -1328,6 +1501,33 @@ class GameProxy:
 
     def set_gameover_guard_expression(self, expression: str) -> None:
         self._changeset.gameover_guard_expression_override = str(expression).strip()
+
+
+class TurnProxy:
+    """Safe proxy for current turn details (``tw.turn``)."""
+
+    def __init__(
+        self,
+        player_message: str = "",
+        language: Optional[str] = None,
+    ):
+        self._player_message = str(player_message or "").strip()
+        self._language = str(language or "").strip() if language else None
+
+    @property
+    def player_message(self) -> str:
+        """The verbatim or normalized text of the player's message in the current turn."""
+        return self._player_message
+
+    @property
+    def message(self) -> str:
+        """Alias for ``player_message``."""
+        return self._player_message
+
+    @property
+    def language(self) -> Optional[str]:
+        """The language code of the current turn (e.g. 'en', 'de'), if set."""
+        return self._language
 
 
 class QuestsProxy:
@@ -1547,8 +1747,13 @@ class SequencesProxy:
 class DiceProxy:
     """Safe proxy for dice rolls."""
 
-    def roll(self, dice_str: str) -> int:
-        match = re.match(r"^(\d+)?d(\d+)(?:([+-])(\d+))?$", dice_str.strip().lower())
+    def roll(self, dice_spec: Any = 20) -> int:
+        if isinstance(dice_spec, int):
+            return random.randint(1, max(1, dice_spec))
+        target_str = str(dice_spec or "20").strip().lower()
+        if target_str.isdigit():
+            return random.randint(1, max(1, int(target_str)))
+        match = re.match(r"^(\d+)?d(\d+)(?:([+-])(\d+))?$", target_str)
         if not match:
             return random.randint(1, 20)
         num = int(match.group(1) or 1)
@@ -1562,8 +1767,29 @@ class DiceProxy:
             total -= mod
         return total
 
+    def d4(self) -> int:
+        return random.randint(1, 4)
+
+    def d6(self) -> int:
+        return random.randint(1, 6)
+
+    def d8(self) -> int:
+        return random.randint(1, 8)
+
+    def d10(self) -> int:
+        return random.randint(1, 10)
+
+    def d12(self) -> int:
+        return random.randint(1, 12)
+
     def d20(self) -> int:
         return random.randint(1, 20)
+
+    def d100(self) -> int:
+        return random.randint(1, 100)
+
+    def random(self) -> float:
+        return random.random()
 
 
 class GameContext:
@@ -1584,15 +1810,26 @@ class GameContext:
         variables: Optional[dict[str, Any]] = None,
         is_debug_enabled: bool = False,
         llm_asker: Optional[LlmAsker] = None,
+        image_generator: Optional[ImageGenerator] = None,
         clock: Optional[dict[str, Any]] = None,
         active_sequence_id: Optional[str] = None,
         sequences: Optional[list[dict[str, Any]]] = None,
         sequence_progression_mode: str = "linear",
+        audio: Optional[dict[str, Any]] = None,
+        audio_library: Optional[list[dict[str, Any]]] = None,
+        party: Optional[dict[str, Any]] = None,
+        respawn: Optional[dict[str, Any]] = None,
+        npc_memory: Optional[dict[str, Any]] = None,
+        player_message: str = "",
+        language: Optional[str] = None,
     ):
         raw_vars = dict(script_vars if script_vars is not None else (variables or {}))
         self.is_debug_enabled = bool(is_debug_enabled)
         self.changeset = ScriptChangeset()
+        self.turn = TurnProxy(player_message=player_message, language=language)
+        self.player_turn = self.turn
         self.player = PlayerProxy(avatar_data or {}, self.changeset)
+        self.inventory = InventoryProxy(self.player)
         entity_dict = entities or {}
         npc_entities = {
             k: v
@@ -1616,20 +1853,31 @@ class GameContext:
             current_player_scene_id=current_scene_id,
         )
         self.items = self.objects
+        # NPC memory (entity_states["__npc_memory__"]) for npc.remember / recall / forget.
+        self.npcs.load_memories(npc_memory)
         mover = ItemMover(self.changeset, self.player, self.npcs, self.objects, current_scene_id)
         self.player._mover = self.npcs.mover = self.objects.mover = mover
         self.switches = SwitchesProxy(entity_dict, self.changeset, context=self)
         self.scene = SceneProxy(current_scene_id, self.changeset, self.npcs, self.objects)
+        self.generated_scene: Optional[dict[str, Any]] = None
         self.exits = ExitProxy(exit_states or {}, self.changeset)
         self.vars = VarsProxy(raw_vars, self.changeset, story_flags=story_flags)
         self.flags = StoryFlagsProxy(story_flags or {}, self.changeset)
-        self.story = StoryProxy(self.changeset, is_debug_enabled=self.is_debug_enabled)
+        # Without a generator (guards, hard rules, session init) tw.image.generate returns "".
+        self.image = ImageProxy(
+            image_generator, self.changeset, is_debug_enabled=self.is_debug_enabled
+        )
+        self.media = self.image
+        self.story = StoryProxy(
+            self.changeset, is_debug_enabled=self.is_debug_enabled, image=self.image
+        )
         self.log = LogProxy(self.changeset, is_debug_enabled=self.is_debug_enabled)
         self.console = self.log
+        self.npcs.debug = lambda message: self.log.debug(message, in_game=True)
         self.memories = MemoriesProxy(self.changeset)
         # tw.time: the clock view comes from game_clock.clock_view(); without one, defaults.
         self.time = TimeProxy(self.changeset, clock or default_clock_view(in_game_time), self)
-        self.game = GameProxy(self.changeset, in_game_time, clock=self.time)
+        self.game = GameProxy(self.changeset, in_game_time, clock=self.time, respawn=respawn)
         self.session = self.game
         self.quests = QuestsProxy(quests or [], self.changeset)
         self.awards = AwardsProxy(self.changeset)
@@ -1643,6 +1891,12 @@ class GameContext:
         self.sequence = self.sequences
         self.dice = DiceProxy()
         self.dialog = DialogProxy(self.changeset, self)
+        # tw.audio: the session's audio state (audio_state.read_audio_state), else empty.
+        self.audio = AudioProxy(self.changeset, audio, self, library=audio_library)
+        # Former name, kept so scripts written before the rename keep working.
+        self.music = self.audio
+        # tw.party: the session party (entity_states["__party__"]), else empty.
+        self.party = PartyProxy(self.changeset, party, npc_entities, self.npcs, self)
         # Without an asker (guards, hard rules, session init) tw.llm.ask returns "".
         self.llm = LlmProxy(llm_asker, self.changeset, is_debug_enabled=self.is_debug_enabled)
         self.json = JsonProxy(self.changeset, is_debug_enabled=self.is_debug_enabled)
@@ -1667,6 +1921,21 @@ class GameContext:
         """Shortcut for tw.story.system_message(). Emits system notification."""
         self.story.system_message(message)
 
+    def generate_image(
+        self,
+        prompt: str,
+        model: str = "simple",
+        apply_style: bool = True,
+        show_in_chat: bool = True,
+        caption: str = "",
+    ) -> str:
+        """Shortcut for tw.image.generate(). Returns the image URL or ""."""
+        return self.image.generate(prompt, model, apply_style, show_in_chat, caption)
+
+    def show_image(self, image_url: str, caption: str = "") -> None:
+        """Shortcut for tw.image.show(). Posts an image to the story feed."""
+        self.image.show(image_url, caption)
+
     def save(self, label: str = "") -> None:
         """Creates a save state (checkpoint) of the game, e.g. before an important decision."""
         if len(self.changeset.save_requests) < MAX_SAVES_PER_SCRIPT:
@@ -1676,6 +1945,10 @@ class GameContext:
         """Shortcut for tw.story.direct(). Gives the GM a soft direction."""
         self.story.direct(instruction, after=after, after_args=after_args)
 
+    def skip_narration(self) -> None:
+        """Shortcut for tw.story.skip_narration(): no GM narration in the next pass."""
+        self.story.skip_narration()
+
     def debug(self, *args: Any, sep: str = " ") -> None:
         """Emits an in-game debug notification if debug mode is active and logs to console."""
         self.log.debug(*args, sep=sep, in_game=True)
@@ -1683,3 +1956,8 @@ class GameContext:
     def debug_message(self, *args: Any, sep: str = " ") -> None:
         """Alias for tw.debug()."""
         self.debug(*args, sep=sep)
+
+    @property
+    def player_message(self) -> str:
+        """Shortcut for tw.turn.player_message: the player's message in the current turn."""
+        return self.turn.player_message

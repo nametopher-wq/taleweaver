@@ -5,7 +5,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import datetime, UTC
 from typing import Any
 
@@ -14,14 +14,21 @@ from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from backend.api.routes.adventures.agent_commands import (
-    PLAYAGENT_COMMANDS,
+    AGENT_CONSOLE_COMMANDS,
+    console_args,
     handle_playagent_command,
 )
 from backend.api.routes.adventures.after_narration import run_after_narration
 from backend.api.routes.adventures.game_clock_flow import tick_after_narration
+from backend.api.routes.adventures.history_compression_window import messages_to_compress
+from backend.api.routes.adventures.story_continuation import (
+    CONTINUE_STORY_COMMAND,
+    continue_story,
+)
 from backend.api.routes.adventures.logic import AdventureLogic
 from backend.api.routes.adventures.npc_give import typed_give_command
 from backend.api.routes.adventures.talent_use import resolve_talent_request, stream_talent_turn
+from backend.api.routes.adventures.script_image import make_script_image_generator
 from backend.api.routes.adventures.script_llm import make_script_llm_asker
 from backend.api.routes.adventures.session_adventure import SessionAdventure, load_session_adventure
 from backend.core.narration_budget import log_narration_budget
@@ -60,11 +67,20 @@ from backend.api.routes.adventures.turn_prompt_layout import (
     build_pass1_user_prompt,
 )
 from backend.core import prompts
+from backend.core.api_keys import PersonalKeyRequiredError, key_source, personal_key_message
 from backend.core.config import settings
 from backend.core.llm_logger import log_structured_event
+from backend.core.llm_request_tuning import bind_llm_session
 from backend.core.llm_router import GameMasterLLM
 from backend.engine.interaction.command_parser import CommandParser
 from backend.engine.interaction.map_engine import MapEngine
+from backend.engine.sessions.scene_entry import enter_scene
+from backend.engine.party.party_ops import apply_session_party_ops
+from backend.engine.party.party_state import PARTY_KEY
+from backend.engine.rules.npc_memory import NPC_MEMORY_STATE_KEY, apply_npc_memory_ops
+from backend.engine.rules.respawn import RESPAWN_KEY, apply_respawn_point
+from backend.engine.rules.world_memories import add_world_memory, make_world_memory
+from backend.engine.audio.browser_tts import uses_vocal_tags
 from backend.engine.rules.walkthrough_unlocks import WALKTHROUGH_REVEAL_COST
 from backend.engine.sessions.session_checkpoint_service import SessionCheckpointService
 from backend.engine.interaction.llm_intents import (
@@ -79,15 +95,33 @@ from backend.engine.rules.rule_engine import (
     AttackResult,
     GameEvent,
     GameOverError,
+    ProtagonistDownError,
     SkillCheckResult,
     WorldEntityUpdate,
 )
 from backend.engine.scripting import GameContext, ScriptChangeset, ScriptRunner, ScriptMessage
 from backend.api.routes.adventures.award_granting import grant_awards
+from backend.api.routes.adventures.dialog_narration import open_choice_reminder
+from backend.api.routes.adventures.handover_flow import (
+    apply_item_handovers,
+    handover_recipients,
+)
 from backend.api.routes.adventures.interaction_hooks import fire_interact_triggers
 from backend.api.routes.adventures.out_of_turn_progress import apply_out_of_turn_progress
 from backend.engine.interaction.interaction_targets import interacted_entity_ids
 from backend.engine.rules.sequence_scripts import sequence_scripts
+from backend.api.routes.adventures.audio_snapshot import build_audio_snapshot
+from backend.api.routes.adventures.dynamic_scene_media import (
+    PendingDynamicVisuals,
+    cancel_pending_dynamic_visuals,
+    drain_pending_dynamic_visuals,
+)
+from backend.engine.audio.audio_state import apply_audio_ops, read_audio_state
+from backend.engine.scripting.narration_skip import (
+    no_narration,
+    store_skip_narration,
+    take_skip_narration,
+)
 from backend.engine.rules.game_clock import apply_changeset_clock, clock_view
 from backend.engine.interaction.script_item_apply import insert_cloned_entities
 from backend.engine.scripting.dialog import store_pending_dialog
@@ -220,6 +254,8 @@ def _friendly_llm_error_message(exc: Exception) -> str | None:
 
     lower_text = str(exc or "").lower()
 
+    if isinstance(exc, PersonalKeyRequiredError):
+        return personal_key_message(exc.provider, exc.reason)
     if _is_token_limit_error(exc):
         return _friendly_token_limit_message()
     if _is_rate_limit_error(exc):
@@ -304,6 +340,7 @@ from backend.api.routes.adventures.turn_combat import TurnCombatManager  # noqa:
 from backend.api.routes.adventures.post_turn_hooks import PostTurnHooks  # noqa: E402
 from backend.api.routes.adventures.turn_guardrails import TurnGuardrailsManager  # noqa: E402
 from backend.api.routes.adventures.turn_checkpoints import TurnCheckpoints  # noqa: E402
+from backend.api.routes.adventures.respawn_flow import end_or_respawn  # noqa: E402
 from backend.api.routes.adventures.turn_interactions import TurnInteractionsManager  # noqa: E402
 from backend.api.routes.adventures.turn_state_applier import TurnStateApplier  # noqa: E402
 from backend.api.routes.adventures.turn_suggestions import TurnSuggestionsManager  # noqa: E402
@@ -347,6 +384,7 @@ class GameTurnManager:
         self._llm_context_builder = TurnLlmContextBuilder(self)
         self.combat = TurnCombatManager(self)
         self.pending_npc_attacks: list[str] = []
+        self.pending_dynamic_visuals: list[PendingDynamicVisuals] = []
         self.guardrails = TurnGuardrailsManager(self)
         self.interactions = TurnInteractionsManager(self)
         self.state_applier = TurnStateApplier(self)
@@ -687,9 +725,11 @@ class GameTurnManager:
     def _build_gm_notes_prompt_block(self) -> str:
         return self._session_helper.build_gm_notes_prompt_block()
 
-    def _build_world_memories_prompt_block(self) -> str:
+    def _build_world_memories_prompt_block(self, present_npc_ids: Iterable[str] = ()) -> str:
         current_scene_id = self.state.current_scene_id if self.state else "START"
-        return self._session_helper.build_world_memories_prompt_block(current_scene_id)
+        return self._session_helper.build_world_memories_prompt_block(
+            current_scene_id, present_npc_ids
+        )
 
     def _build_compressed_history_prompt_block(self) -> str:
         return self._session_helper.build_compressed_history_prompt_block()
@@ -711,6 +751,7 @@ class GameTurnManager:
         if not self.state:
             logger.warning(f"[Turn {self.game_id}] Initialization failed: Session state not found.")
             return False
+        bind_llm_session(self.state.session_id)
 
         # The session plays from its own adventure copy, never from the live template.
         if not self.adventure:
@@ -765,15 +806,18 @@ class GameTurnManager:
     ) -> AsyncGenerator[str, None]:
         """Runs one turn and applies post-turn hooks (special unlocks, NPC attacks) before its final event."""
         hooks = PostTurnHooks(self)
-        async for chunk in self._process_turn_inner(message, auto_visualize, language):
-            if not chunk.startswith("event: final"):
-                yield chunk
-                continue
-            # Commands that skip the narration pass still save their checkpoints here.
-            for checkpoint_event in await self._persist_pending_checkpoints():
-                yield checkpoint_event
-            async for hooked in hooks.process_final(chunk):
-                yield hooked
+        try:
+            async for chunk in self._process_turn_inner(message, auto_visualize, language):
+                if not chunk.startswith("event: final"):
+                    yield chunk
+                    continue
+                # Commands that skip the narration pass still save their checkpoints here.
+                for checkpoint_event in await self._persist_pending_checkpoints():
+                    yield checkpoint_event
+                async for hooked in hooks.process_final(chunk):
+                    yield hooked
+        finally:
+            cancel_pending_dynamic_visuals(self.pending_dynamic_visuals)
 
     async def _command_final_event(self) -> str:
         """Final SSE event for commands that skip the narration pass (state snapshot only)."""
@@ -816,6 +860,7 @@ class GameTurnManager:
             if normalized_user_msg != user_msg:
                 user_msg = normalized_user_msg
                 actual_user_input = normalized_user_msg
+        self.current_user_message = actual_user_input
 
         if user_msg.lower() in {"/shuffle", "/suggest", "/suggestions"}:
             last_response = await self._load_last_assistant_message()
@@ -824,9 +869,24 @@ class GameTurnManager:
             yield await self._command_final_event()
             return
 
+        if user_msg.lower() == CONTINUE_STORY_COMMAND:
+            try:
+                async for chunk in continue_story(self, language):
+                    yield chunk
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                detail = (
+                    _friendly_llm_error_message(exc) or _friendly_llm_unexpected_error_message()
+                )
+                yield f"event: error\ndata: {json.dumps({'detail': detail, 'retryable': True})}\n\n"
+            return
+
         cmd_parts = user_msg.strip().split(None, 1)
-        if cmd_parts and cmd_parts[0].lower() in PLAYAGENT_COMMANDS:
-            cmd_args = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+        if cmd_parts and cmd_parts[0].lower() in AGENT_CONSOLE_COMMANDS:
+            cmd_args = console_args(
+                cmd_parts[0], cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+            )
             async for chunk in handle_playagent_command(self, cmd_args):
                 yield chunk
 
@@ -937,6 +997,13 @@ class GameTurnManager:
                 yield f"event: status\ndata: {json.dumps({'content': 'The Game Master evaluates your situation...'})}\n\n"
             elif response.startswith("[TRIGGER_SAY]"):
                 user_msg = f'Say out loud: "{response[13:].strip()}"'
+                # Continue turn as normal
+            elif response.startswith("[TRIGGER_GREET]"):
+                greet_target = response[15:].strip()
+                if greet_target:
+                    user_msg = f"You greet {greet_target} with a short, friendly greeting."
+                else:
+                    user_msg = "You greet the people around you with a short, friendly greeting."
                 # Continue turn as normal
             elif response.startswith("[TRIGGER_INSPECT]"):
                 user_msg = f"Inspect {response[17:].strip()}"
@@ -1463,10 +1530,7 @@ class GameTurnManager:
                 if game_event.game_completed:
                     await self._finalize_session("completed", game_event.status_note)
             except GameOverError as goe:
-                await self._finalize_session("game_over", str(goe))
-                # Ensure the narration knows about the game over
-                game_event.game_over = True
-                game_event.status_note = str(goe)
+                await end_or_respawn(self, goe, game_event)
 
         elif run_generator_tool_intent_pass and not handled_generator_confirmation:
             yield f"event: status\ndata: {json.dumps({'content': 'Checking generator tools...'})}\n\n"
@@ -1674,9 +1738,16 @@ class GameTurnManager:
                         "game_over", game_event.status_note or "Game over."
                     )
             except GameOverError as goe:
-                await self._finalize_session("game_over", str(goe))
-                game_event.game_over = True
-                game_event.status_note = str(goe)
+                await end_or_respawn(self, goe, game_event)
+
+        # Item handovers Pass 1 reported (given_items): move the items, fire receive triggers.
+        # Before the interaction triggers: the handover is the interaction with the recipient,
+        # so its receive trigger (e.g. a choice dialog) is not pre-empted by on_interact.
+        try:
+            async for handover_event in apply_item_handovers(self, game_event):
+                yield handover_event
+        except GameOverError as goe:
+            await end_or_respawn(self, goe, game_event)
 
         # Entity interactions: scripted and inline on_interact triggers. Runs in every rule
         # mode; without the mechanics pass only entities named in the message count. An
@@ -1692,6 +1763,8 @@ class GameTurnManager:
                     [ue.entity_id for ue in getattr(game_event, "updated_entities", None) or []],
                 )
             )
+            recipients = handover_recipients(game_event)
+            interacted_ids = [i for i in interacted_ids if str(i).upper() not in recipients]
             for entity_id in interacted_ids:
                 sys_msgs, rejected = await fire_interact_triggers(
                     self, script_runner, entity_id, game_event
@@ -1700,10 +1773,7 @@ class GameTurnManager:
                 for sm in sys_msgs:
                     yield sse_role_message(sm)
         except GameOverError as goe:
-            await self._finalize_session("game_over", str(goe))
-            if isinstance(game_event, GameEvent):
-                game_event.game_over = True
-                game_event.status_note = str(goe)
+            await end_or_respawn(self, goe, game_event)
 
         # Logic-pass completion scripts (on_logic_pass_done)
         if script_runner.scripts:
@@ -1716,10 +1786,7 @@ class GameTurnManager:
                     for sm in sys_msgs:
                         yield sse_role_message(sm)
             except GameOverError as goe:
-                await self._finalize_session("game_over", str(goe))
-                if isinstance(game_event, GameEvent):
-                    game_event.game_over = True
-                    game_event.status_note = str(goe)
+                await end_or_respawn(self, goe, game_event)
 
         # The scripts above ran after the logic pass evaluated quests, awards and sequences;
         # re-check so what they changed (e.g. a console setting a quest variable) counts now.
@@ -1728,7 +1795,7 @@ class GameTurnManager:
             for pm in progress_msgs:
                 yield sse_role_message(pm)
         except GameOverError as goe:
-            await self._finalize_session("game_over", str(goe))
+            await end_or_respawn(self, goe, game_event)
 
         # In-game turn: only a scene or sequence change advances time, ticks, and turn scripts.
         turn_advanced = crossed_turn_boundary(self.state, self._turn_anchor)
@@ -1742,6 +1809,9 @@ class GameTurnManager:
         ctx = await self._llm_context_builder.build_context(user_msg=user_msg, language=language)
 
         # Push a state snapshot before narration so scene/entity images can update immediately on scene changes.
+        await drain_pending_dynamic_visuals(
+            self.db, self.state, self.pending_dynamic_visuals, only_done=True
+        )
         await self.db.flush()
         pre_narration_state = jsonable_encoder(
             {
@@ -1765,6 +1835,8 @@ class GameTurnManager:
                 "world_rumors": self.state.world_rumors or [],
                 "scene_id": self.state.current_scene_id,
                 "sequence_id": self.state.active_sequence_id,
+                # Audio a script started (or speech it stopped) applies before the narration.
+                "audio": await build_audio_snapshot(self.db, self.state, None, self.user),
                 **self._build_prompt_suggestions_payload(),
                 **self._build_terminal_flags_payload(),
                 "status": "success",
@@ -1783,7 +1855,7 @@ class GameTurnManager:
             yield f"event: error\ndata: {json.dumps({'detail': 'Narration model configuration is invalid. Please check your settings and try again.'})}\n\n"
             return
         tts_settings = self.user.tts_settings or {}
-        use_vocal_tags = tts_settings.get("use_vocal_tags", True)
+        use_vocal_tags = uses_vocal_tags(tts_settings)
 
         if rule_violations and game_event:
             game_event.narrative_description = (
@@ -1807,11 +1879,16 @@ class GameTurnManager:
         ]
         narration_prompt = "\n\n".join(part for part in narration_prompt_parts if part)
 
+        # The dialogue format reminder is appended last by build_narration_turn_block.
         reminders: list[str] = [
             narration_style_reminder(getattr(self.state, "narration_style", None))
         ]
         if use_vocal_tags:
             reminders.append(vocal_tag_reminder())
+        choice_note = open_choice_reminder(self.state.entity_states)
+        if choice_note:
+            # A trigger of this turn opened a choice dialog: its answer decides, not Pass 2.
+            reminders.append(choice_note)
         if language:
             reminders.append(
                 f"Respond in {language.upper()} only (except voice tags like [curious], which MUST always remain in English). "
@@ -1843,13 +1920,20 @@ class GameTurnManager:
             f"(memory_turns={memory_turns}, messages={len(narration_messages)})"
         )
         stream_usage: Any = None
+        finish_reason: Any = None
+        # tw.story.skip_narration(): no narration (and no TTS) this time.
+        narration_skipped = take_skip_narration(self.state)
         try:
-            stream = await llm.stream_simple_task(
-                narration_prompt,
-                user_msg,
-                complex_model,
-                messages=narration_messages,
-                max_tokens=narration_max_tokens(getattr(self.state, "narration_style", None)),
+            stream = (
+                no_narration()
+                if narration_skipped
+                else await llm.stream_simple_task(
+                    narration_prompt,
+                    user_msg,
+                    complex_model,
+                    messages=narration_messages,
+                    max_tokens=narration_max_tokens(getattr(self.state, "narration_style", None)),
+                )
             )
 
             async for chunk in stream:
@@ -1857,6 +1941,7 @@ class GameTurnManager:
                 choices = getattr(chunk, "choices", None)
                 if not choices:
                     continue
+                finish_reason = getattr(choices[0], "finish_reason", None) or finish_reason
                 delta = choices[0].delta.content or ""
                 if delta:
                     response_text += delta
@@ -1891,6 +1976,8 @@ class GameTurnManager:
             operation="chat_turn",
             phase="narration",
             model=complex_model,
+            # Who pays for this narration: the server or the player's own key.
+            key_source=key_source(self.user.encrypted_api_keys, complex_model_provider),
             memory_turns=memory_turns,
             history_messages_count=len(narration_messages),
             **token_usage,
@@ -1927,7 +2014,16 @@ class GameTurnManager:
             duration_ms=round((time.perf_counter() - cycle_start) * 1000, 2),
         )
 
-        if not (response_text or "").strip():
+        if not (response_text or "").strip() and not narration_skipped:
+            # Typical cause: a thinking model spent the whole max_tokens budget on thinking.
+            logger.warning(
+                "[Turn %s] Narration returned no text (model=%s, finish_reason=%s, "
+                "completion_tokens=%s); using fallback narration.",
+                self.game_id,
+                complex_model,
+                finish_reason,
+                token_usage.get("completion_tokens"),
+            )
             if run_generator_tool_intent_pass:
                 fallback = (
                     "The Architect inclines his head, the Construct awaiting your next directive."
@@ -1956,6 +2052,24 @@ class GameTurnManager:
 
             response_text = fallback
             yield f"event: chunk\ndata: {json.dumps({'content': fallback})}\n\n"
+
+            completion_tokens = token_usage.get("completion_tokens") or 0
+            if finish_reason == "length" and completion_tokens > 0:
+                thinking_on = bool(
+                    (self.user.llm_settings or {}).get("complex_enable_thinking")
+                    or (self.user.llm_settings or {}).get("enable_thinking")
+                )
+                hint = (
+                    "Increase Max Thinking Tokens in Admin -> Intelligence, or switch to a non-thinking model."
+                    if thinking_on
+                    else "Enable Reasoning / Thinking Mode for this model in Admin -> Intelligence, or switch to a non-thinking model."
+                )
+                thinking_notice = (
+                    f"Model '{complex_model}' spent all {completion_tokens} output tokens on "
+                    f"internal thinking without producing narration. {hint}"
+                )
+                await self._save_chat_message("system", thinking_notice)
+                yield f"event: system\ndata: {json.dumps({'role': 'system', 'content': thinking_notice})}\n\n"
 
         id_to_name: dict[str, str] = {}
         for entity in all_entities:
@@ -1993,7 +2107,8 @@ class GameTurnManager:
         assistant_chat = ChatMessage(
             session_id=self.state.session_id, role="assistant", content=response_text
         )
-        self.db.add(assistant_chat)
+        if not narration_skipped:
+            self.db.add(assistant_chat)
 
         # Callbacks attached to this narration's directions (direct/say_directed after=...).
         # Before on_narration_done: callbacks queued there belong to the next narration.
@@ -2014,10 +2129,7 @@ class GameTurnManager:
                     for sm in sys_msgs:
                         yield sse_role_message(sm)
             except GameOverError as goe:
-                await self._finalize_session("game_over", str(goe))
-                if isinstance(game_event, GameEvent):
-                    game_event.game_over = True
-                    game_event.status_note = str(goe)
+                await end_or_respawn(self, goe, game_event)
 
         # Narration tick: the clock advances once per narrated player message.
         async for clock_event in tick_after_narration(self, game_event):
@@ -2198,6 +2310,9 @@ class GameTurnManager:
         # on_turn_end / on_turn_start run at the in-game turn boundary (scene/sequence change),
         # see advance_in_game_turn above.
 
+        await drain_pending_dynamic_visuals(
+            self.db, self.state, self.pending_dynamic_visuals, only_done=False
+        )
         await self.db.commit()
 
         async for comp_event in self._compress_history_if_needed():
@@ -2271,17 +2386,6 @@ class GameTurnManager:
             .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
         )
         all_msgs = list(res.scalars().all())
-        user_indices = [i for i, m in enumerate(all_msgs) if m.role == "user"]
-
-        if len(user_indices) <= max_turns:
-            return
-
-        cutoff_user_idx = len(user_indices) - max_turns
-        cutoff_msg_idx = user_indices[cutoff_user_idx]
-
-        msgs_outside_memory = all_msgs[:cutoff_msg_idx]
-        if not msgs_outside_memory:
-            return
 
         compressed_data = self.state.compressed_history
         current_summary = ""
@@ -2292,16 +2396,10 @@ class GameTurnManager:
         elif isinstance(compressed_data, str):
             current_summary = compressed_data
 
-        start_idx = 0
-        if last_compressed_msg_id:
-            for idx, msg in enumerate(msgs_outside_memory):
-                if msg.id == last_compressed_msg_id:
-                    start_idx = idx + 1
-                    break
-
-        new_msgs_to_compress = msgs_outside_memory[start_idx:]
+        new_msgs_to_compress = messages_to_compress(all_msgs, last_compressed_msg_id, max_turns)
         if not new_msgs_to_compress:
             return
+        msgs_outside_memory = new_msgs_to_compress
 
         formatted_lines = []
         for m in new_msgs_to_compress:
@@ -2863,6 +2961,8 @@ class GameTurnManager:
             settings.TALEWEAVER_DEBUG_ENABLED
             or (self.state and getattr(self.state, "is_debug_enabled", False))
         )
+        user_msg = getattr(self, "current_user_message", "")
+        turn_lang = getattr(self, "turn_language", None)
         return GameContext(
             avatar_data=avatar_dict,
             current_scene_id=self.state.current_scene_id,
@@ -2872,19 +2972,27 @@ class GameTurnManager:
             script_vars=script_vars,
             in_game_time=self.state.in_game_time,
             clock=clock_view(self.state, self.adventure),
+            audio=read_audio_state(self.state.entity_states),
+            audio_library=getattr(self.adventure, "audio_tracks", None),
+            party=session_overrides.get(PARTY_KEY),
+            respawn=session_overrides.get(RESPAWN_KEY),
+            npc_memory=session_overrides.get(NPC_MEMORY_STATE_KEY),
             story_flags=story_flags,
             is_debug_enabled=is_debug,
             llm_asker=make_script_llm_asker(
                 self.user,
                 game_id=self.game_id,
                 adventure_id=self.state.template_id,
-                language=self.turn_language,
+                language=turn_lang,
             ),
+            image_generator=make_script_image_generator(self.user, self.adventure, self.game_id),
             active_sequence_id=self.state.active_sequence_id,
             sequences=getattr(self.adventure, "sequences", None),
             sequence_progression_mode=getattr(
                 self.adventure, "sequence_progression_mode", "linear"
             ),
+            player_message=user_msg,
+            language=turn_lang,
         )
 
     def _get_script_runner(self) -> ScriptRunner:
@@ -2911,14 +3019,21 @@ class GameTurnManager:
             return []
         context = await self._build_script_context()
         runner = self._get_script_runner()
-        scope = {**(extra_scope or {}), "tw": context, "game": context}
+        scope = {
+            "player_message": getattr(self, "current_user_message", ""),
+            **(extra_scope or {}),
+            "tw": context,
+            "game": context,
+        }
         runner.execute_code(code, scope, script_id=f"inline_{trigger_name}_{target_id}")
         applied_messages = await self._apply_script_changeset(context.changeset)
         if context.is_debug_enabled:
             debug_msg = f"[DEBUG: Trigger fired] {trigger_name} on {target_id}"
             await self._save_chat_message("system", debug_msg)
+        # Keep the ScriptMessage objects: callers stream each message with its role, so an NPC
+        # line (tw.npcs.say) or narration stays "assistant" instead of turning into a system note.
         return [
-            str(m)
+            m
             for m in applied_messages
             if not str(getattr(m, "content", m)).strip().startswith("[DEBUG")
         ]
@@ -2959,7 +3074,7 @@ class GameTurnManager:
                 finally:
                     self._in_protagonist_hp_trigger = False
             if self.avatar.hp <= 0:
-                raise GameOverError(f"{self.avatar.name} has fallen! Game Over.")
+                raise ProtagonistDownError(f"{self.avatar.name} has fallen! Game Over.")
 
         if changeset.player_mana_change:
             self.avatar.mana = max(
@@ -2997,7 +3112,7 @@ class GameTurnManager:
             for it in changeset.player_new_items:
                 inv.append(it)
                 system_messages.append(
-                    ScriptMessage(f"Acquired: {it.get('name', it.get('id'))}", role="system")
+                    await self._save_script_notice(f"Acquired: {it.get('name', it.get('id'))}")
                 )
             self.avatar.inventory = inv
 
@@ -3032,8 +3147,30 @@ class GameTurnManager:
                 finally:
                     self._in_protagonist_status_trigger = False
 
-        if changeset.teleport_scene_id:
-            self.state.current_scene_id = changeset.teleport_scene_id
+        # Party changes first, so a companion recruited by this script follows its teleport.
+        apply_session_party_ops(self.state, changeset.party_ops)
+        if changeset.respawn_point is not None or changeset.npc_memory_ops:
+            states = dict(self.state.entity_states or {})
+            apply_respawn_point(states, changeset.respawn_point)
+            apply_npc_memory_ops(states, changeset.npc_memory_ops)
+            self.state.entity_states = states
+            flag_modified(self.state, "entity_states")
+        if changeset.teleport_scene_id or getattr(changeset, "teleport_dynamic_request", None):
+            from backend.api.routes.adventures.dynamic_teleport import apply_script_teleport
+
+            left_scene_id = self.state.current_scene_id
+            await apply_script_teleport(
+                self.db,
+                self.state,
+                changeset,
+                adventure=self.adventure,
+                user=getattr(self, "user", None),
+            )
+            if self.state.current_scene_id != left_scene_id:
+                for msg in await enter_scene(
+                    self.db, self.state, left_scene_id, adventure=self.adventure
+                ):
+                    system_messages.append(await self._save_script_notice(msg))
 
         await insert_cloned_entities(self.db, self.state, changeset)
         entity_states = dict(self.state.entity_states or {})
@@ -3066,6 +3203,8 @@ class GameTurnManager:
         store_pending_dialog(entity_states, changeset.pending_dialog)
         store_gm_directions(entity_states, changeset.gm_directions, changeset.after_narration)
         apply_changeset_clock(self.state, entity_states, changeset.clock_ops)
+        apply_audio_ops(entity_states, changeset.audio_ops)
+        store_skip_narration(entity_states, changeset.skip_narration)
         self.state.entity_states = entity_states
         flag_modified(self.state, "entity_states")
 
@@ -3144,15 +3283,14 @@ class GameTurnManager:
         if changeset.new_memories:
             memories = list(self.state.world_memories or [])
             for m in changeset.new_memories:
-                is_dup = any(
-                    (em.get("description") or "").strip().lower()
-                    == (m.get("description") or "").strip().lower()
-                    and em.get("scope") == m.get("scope")
-                    and (m.get("scope") == "global" or em.get("scene_id") == m.get("scene_id"))
-                    for em in memories
+                entry = make_world_memory(
+                    m.get("description"),
+                    scope=m.get("scope"),
+                    emotion=m.get("emotion"),
+                    npc_id=m.get("npc_id"),
+                    scene_id=m.get("scene_id") or self.state.current_scene_id,
                 )
-                if not is_dup:
-                    memories.append(m)
+                memories, _ = add_world_memory(memories, entry)
             self.state.world_memories = memories
 
         for qid in changeset.completed_quest_ids:

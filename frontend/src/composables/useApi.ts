@@ -19,6 +19,14 @@ import type {
   GeneratorSurprisePresetPayload,
   GeneratorSurprisePresetResponse,
   TtsVoiceList,
+  VoiceMapFileFormat,
+  VoiceMapImportResult,
+  VoiceMapRow,
+  VoiceMapTable,
+  SpeechModelList,
+  SpeechVoiceList,
+  LeaderboardResponse,
+  EarnedAward,
 } from '@/types'
 import { authState } from '@/store/auth'
 import { configState } from '@/store/config'
@@ -60,6 +68,56 @@ export interface PlayerSessionSummary {
   sequences_total: number
   created_at?: string | null
   updated_at?: string | null
+  last_played_at?: string | null
+}
+
+export type PlayerSessionStatus = 'active' | 'completed' | 'game_over' | 'archived'
+export type PlayerSessionSort = 'recent' | 'oldest' | 'title' | 'xp'
+export type PlayerSessionCounts = Record<PlayerSessionStatus | 'all', number>
+
+export interface PlayerSessionQuery {
+  status?: PlayerSessionStatus | null
+  search?: string
+  sort?: PlayerSessionSort
+  limit?: number
+  offset?: number
+}
+
+export interface PlayerSessionPage {
+  items: PlayerSessionSummary[]
+  /** Sessions matching status filter and search. */
+  total: number
+  /** Per status for the search alone (filter chip numbers). */
+  counts: PlayerSessionCounts
+  /** Per status without any filter (profile stats). */
+  totals: PlayerSessionCounts
+}
+
+export type KeyPolicy = 'server' | 'user_optional' | 'user_required' | 'disabled'
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 45000
+export type KeySource = 'server' | 'personal' | 'missing' | 'disabled'
+export type KeyPolicyMap = Record<string, KeyPolicy>
+
+export interface PersonalKeyProvider {
+  id: string
+  name: string
+  policy: KeyPolicy
+  can_store_key: boolean
+  has_personal_key: boolean
+  source: KeySource
+}
+
+export interface MyApiKeysResponse {
+  providers: PersonalKeyProvider[]
+  personal_keys_allowed: boolean
+  verified?: boolean
+}
+
+export interface KeyPolicyResponse {
+  policy: KeyPolicyMap
+  providers: Array<{ id: string, name: string }>
+  policies: KeyPolicy[]
 }
 
 class ApiError extends Error {
@@ -87,6 +145,7 @@ interface SettingsResponse {
   game_settings: Record<string, unknown>
   is_llm_configured: boolean
   is_t2i_configured: boolean
+  missing_personal_keys?: Array<{ id: string, reason: 'missing' | 'disabled', message: string }>
   image_styles_catalog: CatalogTile[]
   tone_catalog: CatalogTile[]
   tts_settings: Record<string, unknown>
@@ -161,7 +220,7 @@ async function request<T>(path: string, init?: ApiFetchInit): Promise<T> {
     const res = await apiFetch(path, {
       ...init,
       headers,
-      timeoutMs: init?.timeoutMs ?? 20000,
+      timeoutMs: init?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     })
     
     // If we get here, the server at least responded
@@ -220,7 +279,7 @@ async function requestBlob(path: string, init?: ApiFetchInit): Promise<Blob> {
     const res = await apiFetch(path, {
       ...init,
       headers,
-      timeoutMs: init?.timeoutMs ?? 20000,
+      timeoutMs: init?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     })
     
     configState.isBackendReachable = true
@@ -365,7 +424,21 @@ export const GENERATION_SAYINGS: string[] = [
   "Measuring the depth of the rabbit hole..."
 ]
 
+function toVoiceMapCells(items: VoiceMapRow[]): Array<Pick<VoiceMapRow, 'id' | 'google' | 'custom_openai'>> {
+  return items.map(({ id, google, custom_openai }) => ({ id, google, custom_openai }))
+}
+
 export const api = {
+  /** Fetches all players ranked by XP, awards and quest outcomes. */
+  getLeaderboard(): Promise<LeaderboardResponse> {
+    return request<LeaderboardResponse>('/leaderboard')
+  },
+
+  /** Fetches the awards earned by another player. */
+  getPlayerAwards(userId: string): Promise<EarnedAward[]> {
+    return request<EarnedAward[]>(`/leaderboard/player/${encodeURIComponent(userId)}/awards`)
+  },
+
   /** Manually trigger import of example adventures (samples). */
   importExamples(): Promise<{ status: string; message: string }> {
     return request('/adventures/import-examples', { method: 'POST' })
@@ -539,7 +612,7 @@ export const api = {
 
 
   /** Answers the choice dialog a script opened (tw.dialog.choose) and runs its handler. */
-  chooseDialogOption(gameId: string, dialogId: string, index: number, language?: string): Promise<{ status: string; messages: string[] }> {
+  chooseDialogOption(gameId: string, dialogId: string, index: number, language?: string): Promise<{ status: string; messages: string[]; continue_story?: boolean }> {
     return request(`/adventures/${gameId}/dialog/choice`, {
       method: 'POST',
       body: JSON.stringify({ dialog_id: dialogId, index, language: language || undefined }),
@@ -553,12 +626,12 @@ export const api = {
 
   /** Creates a new adventure and returns the generated IDs. */
   createAdventure(payload: CreateAdventurePayload): Promise<{ game_id: string; adventure_id: string; avatar_id: string }> {
-    return request('/adventures/', { method: 'POST', body: JSON.stringify(payload) })
+    return request('/adventures/', { method: 'POST', body: JSON.stringify(payload), timeoutMs: 180000 })
   },
 
   /** Checks the Story Idea blueprint tags (syntax, scripts, references) before generation. */
   validateStoryBlueprint(text: string): Promise<BlueprintValidationResult> {
-    return request('/adventures/blueprint/validate', { method: 'POST', body: JSON.stringify({ text }) })
+    return request('/adventures/blueprint/validate', { method: 'POST', body: JSON.stringify({ text }), timeoutMs: 60000 })
   },
 
   /** Generates or improves title and story idea from user input. */
@@ -582,7 +655,7 @@ export const api = {
 
   /** Import an adventure JSON payload (parsed .adv) and open creation flow on the server. */
   importAdventure(payload: AdventureImportPayload): Promise<{ game_id: string; adventure_id: string; avatar_id: string }> {
-    return request('/adventures/import', { method: 'POST', body: JSON.stringify(payload) })
+    return request('/adventures/import', { method: 'POST', body: JSON.stringify(payload), timeoutMs: 120000 })
   },
 
   /** Duplicates an existing adventure template and its world blueprint. */
@@ -749,7 +822,7 @@ export const api = {
     return request('/tts/generate', { method: 'POST', body: JSON.stringify(payload), timeoutMs: 120000 })
   },
 
-  testTTS(): Promise<{ status: string; audio_url?: string; message?: string }> {
+  testTTS(): Promise<{ status: string; audio_url?: string; message?: string; browser?: boolean }> {
     return request('/tts/test-connection', { method: 'POST', timeoutMs: 60000 })
   },
 
@@ -762,6 +835,49 @@ export const api = {
   getTtsVoices(provider?: string): Promise<TtsVoiceList> {
     const query = provider ? `?provider=${encodeURIComponent(provider)}` : ''
     return request(`/tts/voices${query}`, { method: 'GET' })
+  },
+
+  /** Admin table: Google / OpenAI-compatible voice per voice of the voice list. */
+  getVoiceMap(): Promise<VoiceMapTable> {
+    return request('/settings/voice-map', { method: 'GET' })
+  },
+
+  saveVoiceMap(items: VoiceMapRow[]): Promise<{ status: string; items: VoiceMapRow[] }> {
+    return request('/settings/voice-map', { method: 'PUT', body: JSON.stringify({ items: toVoiceMapCells(items) }) })
+  },
+
+  resetVoiceMap(): Promise<{ status: string; items: VoiceMapRow[] }> {
+    return request('/settings/voice-map', { method: 'DELETE' })
+  },
+
+  /** Lays an import file over the edited table; nothing is saved until `saveVoiceMap`. */
+  importVoiceMap(content: string, format: VoiceMapFileFormat, items: VoiceMapRow[]): Promise<VoiceMapImportResult> {
+    return request('/settings/voice-map/import', {
+      method: 'POST',
+      body: JSON.stringify({ content, format, items: toVoiceMapCells(items) }),
+    })
+  },
+
+  exportVoiceMap(format: VoiceMapFileFormat, items: VoiceMapRow[]): Promise<{ filename: string; content: string }> {
+    return request('/settings/voice-map/export', {
+      method: 'POST',
+      body: JSON.stringify({ format, items: toVoiceMapCells(items) }),
+    })
+  },
+
+  /** Models of the OpenAI-compatible speech server (admin); `baseUrl` checks one before saving. */
+  getSpeechModels(baseUrl?: string): Promise<SpeechModelList> {
+    const query = baseUrl ? `?base_url=${encodeURIComponent(baseUrl)}` : ''
+    return request(`/tts/openai-compatible/models${query}`, { method: 'GET', timeoutMs: 20000 })
+  },
+
+  /** Voices of the OpenAI-compatible speech server for `model` (admin). */
+  getSpeechVoices(baseUrl?: string, model?: string): Promise<SpeechVoiceList> {
+    const params = new URLSearchParams()
+    if (baseUrl) params.set('base_url', baseUrl)
+    if (model) params.set('model', model)
+    const query = params.toString() ? `?${params.toString()}` : ''
+    return request(`/tts/openai-compatible/voices${query}`, { method: 'GET', timeoutMs: 20000 })
   },
 
   getElevenLabsModels(): Promise<Array<{ model_id: string, name: string }>> {
@@ -858,12 +974,23 @@ export const api = {
     })
   },
 
-  updateMyPreferences(payload: { default_language?: string | null; tts_preferences?: TtsPreferences }): Promise<any> {
+  updateMyPreferences(payload: {
+    default_language?: string | null
+    tts_preferences?: TtsPreferences
+    clock_format?: 'adventure' | '24h' | '12h'
+  }): Promise<any> {
     return request('/users/me/preferences', { method: 'PUT', body: JSON.stringify(payload) })
   },
 
-  getMySessions(): Promise<PlayerSessionSummary[]> {
-    return request('/users/me/sessions')
+  getMySessions(query: PlayerSessionQuery = {}): Promise<PlayerSessionPage> {
+    const params = new URLSearchParams()
+    if (query.status) params.set('status', query.status)
+    if (query.search?.trim()) params.set('search', query.search.trim())
+    if (query.sort) params.set('sort', query.sort)
+    if (query.limit) params.set('limit', String(query.limit))
+    if (query.offset) params.set('offset', String(query.offset))
+    const qs = params.toString()
+    return request(`/users/me/sessions${qs ? `?${qs}` : ''}`)
   },
 
   createPasswordResetLink(userId: string): Promise<{ token: string; expires_in_hours: number }> {
@@ -872,6 +999,37 @@ export const api = {
 
   setupRootAdmin(payload: any): Promise<any> {
     return request('/auth/setup-root', { method: 'POST', body: JSON.stringify(payload) })
+  },
+
+  getMyApiKeys(): Promise<MyApiKeysResponse> {
+    return request('/users/me/api-keys')
+  },
+
+  storeMyApiKey(provider: string, apiKey: string): Promise<MyApiKeysResponse> {
+    return request(`/users/me/api-keys/${encodeURIComponent(provider)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ api_key: apiKey }),
+      timeoutMs: 30000,
+    })
+  },
+
+  deleteMyApiKey(provider: string): Promise<MyApiKeysResponse> {
+    return request(`/users/me/api-keys/${encodeURIComponent(provider)}`, { method: 'DELETE' })
+  },
+
+  getKeyPolicy(): Promise<KeyPolicyResponse> {
+    return request('/settings/key-policy')
+  },
+
+  updateKeyPolicy(policy: KeyPolicyMap): Promise<{ status: string, policy: KeyPolicyMap }> {
+    return request('/settings/key-policy', { method: 'PUT', body: JSON.stringify({ policy }) })
+  },
+
+  updateUserKeyPolicy(userId: string, policy: KeyPolicyMap): Promise<{ status: string, overrides: KeyPolicyMap }> {
+    return request(`/users/${encodeURIComponent(userId)}/key-policy`, {
+      method: 'PUT',
+      body: JSON.stringify({ policy }),
+    })
   },
 
   listUsers(): Promise<any[]> {
@@ -914,7 +1072,7 @@ export const api = {
   },
 
   generateMyBio(): Promise<{ bio: string }> {
-    return request('/users/me/bio/generate', { method: 'POST' })
+    return request('/users/me/bio/generate', { method: 'POST', timeoutMs: 60000 })
   },
 
   async generateMyProfileImage(bio?: string): Promise<any> {

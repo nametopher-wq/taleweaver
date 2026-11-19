@@ -2,7 +2,8 @@ export interface ChatMessage {
   id?: string
   /** Client-side render key; stays the same when the history is reloaded after a turn. */
   _key?: string
-  role: 'user' | 'assistant' | 'system' | 'thought' | 'license_info'
+  /** `adventure_ending`: the win / game-over card (JSON content, see AdventureEndingCard). */
+  role: 'user' | 'assistant' | 'system' | 'thought' | 'license_info' | 'adventure_ending'
   content: string
   timestamp: Date
   itemIds?: string[]
@@ -14,6 +15,47 @@ export interface ChatMessage {
 }
 
 /** Character sheet snapshot pushed by the server after every action. */
+/** One of the companion's abilities; `enabled: false` means it is not used in combat. */
+export interface CompanionAbility {
+  id: string
+  name: string
+  description?: string
+  category: string
+  cost_type: string
+  cost: number
+  enabled: boolean
+}
+
+/** The active companion as the hero dialog shows it (backend: companion_sheet.py). */
+export interface CompanionSheet {
+  id: string
+  name: string
+  description?: string | null
+  npc_type?: string | null
+  image_url?: string | null
+  hp?: number | null
+  max_hp?: number | null
+  mana?: number | null
+  max_mana?: number | null
+  stamina?: number | null
+  max_stamina?: number | null
+  stats: Record<string, number | null>
+  /** Carried items that are not equipped. */
+  inventory: InventoryItem[]
+  /** Only HUMANOID and BEING companions have equipment slots; animals and monsters do not. */
+  can_equip?: boolean
+  /** Slot -> equipped item (the protagonist's slots); empty without equipment slots. */
+  equipment: Record<string, InventoryItem | null>
+  /** Special actions from the editor with the player's on/off switch. */
+  abilities: CompanionAbility[]
+  /** Stands in the protagonist's scene. */
+  present: boolean
+  following: boolean
+  is_defeated: boolean
+  tactics: string
+  banter: string
+}
+
 export interface CharacterSheet {
   name: string
   adventure_title?: string | null
@@ -42,6 +84,8 @@ export interface CharacterSheet {
   stats: Record<string, number>
   inventory: InventoryItem[]
   equipment: Record<string, InventoryItem | null>
+  /** The active companion's page of the hero dialog (null without a companion). */
+  companion?: CompanionSheet | null
   status_effects: string[]
   in_game_time: number  // minutes or units elapsed in-game
   start_datetime?: string | null
@@ -65,6 +109,18 @@ export interface CharacterSheet {
   agent_monkey_mode?: boolean
   agent_allow_walkthrough?: boolean
   agent_step_by_step?: boolean
+  /** Pause in seconds between two Play-Agent steps in Auto mode. */
+  agent_step_delay?: number
+  /** In Auto mode, the next Play-Agent step waits until text-to-speech has finished. */
+  agent_wait_for_tts?: boolean
+  /** The Play-Agent may use the current chapter's walkthrough (unlocked with XP, or debug). */
+  agent_walkthrough_unlocked?: boolean
+  /** Debug-only Play-Agent options (Monkey mode) are available. */
+  agent_debug_tools?: boolean
+  /** How much the Play-Agent talks with characters: taciturn, normal, talkative, roleplay. */
+  agent_dialogue_level?: string
+  /** The player's current instruction for the Play-Agent ("" = none). */
+  agent_instruction?: string
   agent_personality?: string
   agent_custom_personality?: string
   max_memory_turns?: number
@@ -108,7 +164,8 @@ export interface AreaTargetOutcome {
 
 /** One stat change of a special attack, e.g. `{ target: 'target', stat: 'hp', amount: '-2d6' }`. */
 export interface SpecialEffect {
-  target: 'target' | 'self'
+  /** `ally`: the caster's party partner (companion for the protagonist, and vice versa). */
+  target: 'target' | 'self' | 'ally'
   stat: CombatStat
   amount: string
 }
@@ -211,7 +268,7 @@ export interface AppliedEffect {
 export interface CombatEventData {
   kind:
     | 'attack' | 'special' | 'initiative' | 'turn' | 'rest' | 'consume' | 'run'
-    | 'event' | 'engage' | 'defeat' | 'fled' | 'victory' | 'game_over' | 'banter'
+    | 'event' | 'engage' | 'defeat' | 'fled' | 'victory' | 'game_over' | 'knocked_out' | 'banter'
   actor?: string | null
   /** Spoken line of a `banter` event (without the speaker name). */
   line?: string
@@ -222,6 +279,7 @@ export interface CombatEventData {
   entity?: string
   label?: string
   action_name?: string
+  /** Special attacks: their category. Weapon attacks: MELEE, RANGED or MAGIC (animation and sounds). */
   category?: SpecialCategory
   stat?: string
   rolled?: boolean
@@ -288,6 +346,14 @@ export interface CombatPlayerState extends CombatantState {
   special_actions?: NormalizedSpecialAttack[]
 }
 
+/** A companion on the protagonist's side; `downed` at 0 HP until the fight ends. */
+export interface CombatPartyMember extends CombatEnemyState {
+  downed?: boolean
+  tactics?: string
+  /** Enemy the protagonist marked: the companion attacks only this one. */
+  mark_id?: string | null
+}
+
 export interface CombatState {
   active: boolean
   round: number
@@ -297,6 +363,8 @@ export interface CombatState {
   /** Current target (kept for single-enemy consumers). */
   enemy: CombatEnemyState
   enemies?: CombatEnemyState[]
+  /** The protagonist's companion fighting on their side (backend: combat/party.py). */
+  party?: CombatPartyMember[]
   target_id?: string | null
   initiative?: InitiativeEntry[]
   turn_index?: number
@@ -320,6 +388,41 @@ export interface PendingDialog {
   prompt: string
   speaker?: string | null
   options: DialogOption[]
+}
+
+/** What a chapter banner in the story feed shows (`sequence_details` of `GET /chat`). */
+export interface SequenceDetail {
+  title: string
+  order?: number | null
+  description?: string | null
+  dynamic?: boolean
+}
+
+/** Script audio (`tw.audio`) of the session, from `GET /chat`. */
+export interface AudioNowPlaying {
+  id: string
+  name?: string | null
+  status: 'pending' | 'ready' | 'failed'
+  url?: string | null
+  error?: string | null
+  loop: boolean
+  /** Cross-fade length in seconds. */
+  fade: number
+  /** Volume of this playback only (0..1), from tw.audio.play(volume=...). */
+  volume?: number
+  /** Who chose the track: a script (tw.audio), the scene's loop or the main theme. */
+  source?: 'script' | 'scene' | 'theme'
+}
+
+export interface AudioSnapshot {
+  /** False when the admin switched audio generation off; rendered audio still plays. */
+  enabled: boolean
+  rev: number
+  /** Script volume 0..1, multiplied with the player's own audio volume. */
+  volume: number
+  now: AudioNowPlaying | null
+  /** tw.audio.stop_speech(): fade out the TTS when `rev` changes (`fade` in seconds). */
+  speech_stop?: { rev: number; fade: number }
 }
 
 export interface MapNode {
@@ -438,6 +541,8 @@ export interface AdventureTemplateSummary {
   has_active_session?: boolean
   /** Last time the session behind active_game_id was opened. */
   last_played_at?: string | null
+  /** The adventure's title track (optional), played while the library tile is hovered. */
+  preview_audio_url?: string | null
   is_paused?: boolean
   scene_id?: string | null
   current_scene_name?: string | null
@@ -498,6 +603,8 @@ export interface CreateAdventurePayload {
   pacing_minutes?: number
   max_time_per_turn?: number | null
   gm_time_control?: boolean
+  /** At 0 HP: `{ on_zero_hp: 'game_over' | 'respawn', respawn_hp_percent }`. */
+  game_over_rules?: Record<string, unknown> | null
   pacing?: Record<string, unknown>
   original_manifest?: Record<string, unknown>
   award_generation_enabled?: boolean
@@ -638,6 +745,26 @@ export interface EarnedAward extends Award {
   earned_at: string
 }
 
+/** One ranked player on the leaderboard (backend/api/routes/leaderboard_api.py). */
+export interface LeaderboardEntry {
+  id: string
+  username: string
+  profile_image_url?: string | null
+  bio?: string | null
+  rank: number
+  total_xp: number
+  completed_quests: number
+  failed_quests: number
+  total_awards: number
+  adventure_count: number
+  earned_awards: EarnedAward[]
+}
+
+export interface LeaderboardResponse {
+  players: LeaderboardEntry[]
+  total_players: number
+}
+
 
 /** A voice from the curated ElevenLabs voice list (backend/core/elevenlabs_voices.json). */
 export interface TtsVoice {
@@ -648,11 +775,64 @@ export interface TtsVoice {
   accent: string
   description: string
   good_for: string[]
+  /** Suggested voices for Google TTS / OpenAI-compatible servers (voice list defaults). */
+  google_voice?: string
+  openai_compatible_voice?: string
+}
+
+/** Model ids of an OpenAI-compatible speech server (GET {base}/models). */
+export interface SpeechModelList {
+  base_url: string
+  models: string[]
+}
+
+/**
+ * Voices of an OpenAI-compatible speech server. `suggested` = OpenAI's voice names (OpenAI
+ * models only); `none` = no list, leave the voice empty for the model's default voice.
+ */
+export interface SpeechVoiceList {
+  base_url: string
+  source: 'server' | 'model' | 'suggested' | 'none'
+  voices: string[]
 }
 
 export interface TtsVoiceList {
   provider: string
-  /** Only ElevenLabs gives characters their own voices; Gemini uses the narrator voice. */
+  /** ElevenLabs always; Google / OpenAI-compatible once the admin mapped at least one voice. */
   supports_npc_voices: boolean
+  /** List voice id -> voice the provider speaks; missing voices use the narrator voice. */
+  provider_voices?: Record<string, string>
   voices: TtsVoice[]
 }
+
+/** One row of the admin voice mapping table (empty cell = narrator voice). */
+export interface VoiceMapRow {
+  id: string
+  name: string
+  gender: string | null
+  age: string
+  accent: string
+  description: string
+  good_for?: string[]
+  best_for?: string[]
+  elevenlabs: string
+  google: string
+  custom_openai: string
+  /** The voice list's suggestion for the cell ("" = none). */
+  suggested_google: string
+  suggested_custom_openai: string
+}
+
+export interface VoiceMapTable {
+  items: VoiceMapRow[]
+  google_voices: Array<{ name: string; gender?: string | null; description?: string | null }>
+}
+
+export interface VoiceMapImportResult {
+  items: VoiceMapRow[]
+  matched: number
+  unknown: string[]
+  errors: string[]
+}
+
+export type VoiceMapFileFormat = 'csv' | 'json'

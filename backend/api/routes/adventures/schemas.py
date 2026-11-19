@@ -315,6 +315,7 @@ class AdventureTemplateResponse(BaseModel):
 
     rule_enforcement_mode: str
     sequence_progression_mode: str = "linear"
+    dynamic_generation: Optional[dict[str, Any]] = None
     strict_rules: bool = True
     time_per_turn: int
     pacing_minutes: int
@@ -329,6 +330,9 @@ class AdventureTemplateResponse(BaseModel):
     selected_image_styles: Optional[list[dict[str, Any]]] = None
     selected_tone: Optional[dict[str, Any]] = None
     narrator_voice: Optional[dict[str, Any]] = None
+    audio_tracks: Optional[list[dict[str, Any]]] = None
+    title_track_id: Optional[str] = None
+    audio_enabled: bool = True
     ui_theme: Optional[dict[str, Any]] = None
     original_prompt: Optional[str] = None
     sequences: Optional[list[dict[str, Any]]] = None
@@ -478,6 +482,8 @@ class AdventureTemplateSummaryResponse(BaseModel):
     active_game_id: Optional[str] = None
     has_active_session: bool = False
     last_played_at: Optional[datetime] = None
+    # Title track (optional), played while the library tile is hovered.
+    preview_audio_url: Optional[str] = None
     scene_id: Optional[str] = None
     current_scene_name: Optional[str] = None
     origin_id: Optional[str] = None
@@ -499,6 +505,7 @@ class AdventureTemplateSummaryResponse(BaseModel):
     can_start: bool = True
     rule_enforcement_mode: Optional[str] = "rpg"
     sequence_progression_mode: Optional[str] = "linear"
+    dynamic_generation: Optional[dict[str, Any]] = None
     selected_image_styles: Optional[list[dict[str, Any]]] = None
 
     @field_validator("selected_tone", mode="before")
@@ -545,6 +552,8 @@ class TerminalEpilogueRequest(BaseModel):
 
 class TerminalEpilogueResponse(BaseModel):
     content: Optional[str] = None
+    # The ending card chat message (role ``adventure_ending``), saved after the epilogue.
+    ending: Optional[dict[str, Any]] = None
     game_over: bool = False
     game_completed: bool = False
     status_note: Optional[str] = None
@@ -568,6 +577,8 @@ class ChatResponse(BaseModel):
     has_more_messages: bool = False
     # Sequence id -> title of the chapters the chat reached (chapter dividers in the story feed).
     sequence_titles: dict[str, str] = Field(default_factory=dict)
+    # Same chapters with what the chat's chapter banner shows: {title, order, description, dynamic}.
+    sequence_details: dict[str, dict[str, Any]] = Field(default_factory=dict)
     sheet: dict[str, Any]
     combat: Optional[dict[str, Any]] = None
     map_data: Optional[dict[str, Any]] = None
@@ -597,6 +608,8 @@ class ChatResponse(BaseModel):
     full_world: Optional[AdventureTemplateDebugResponse] = None
     # Choice dialog opened by a script (tw.dialog.choose) that awaits the player's answer.
     pending_dialog: Optional[dict[str, Any]] = None
+    # Script audio (tw.audio): what to play now and whether its track is rendered yet.
+    audio: Optional[dict[str, Any]] = None
 
 
 class AdventureTemplateImportPayload(BaseModel):
@@ -665,6 +678,7 @@ class AdventureTemplateUpdate(BaseModel):
     original_prompt: Optional[str] = None
     rule_enforcement_mode: Optional[Literal["rpg", "story", "chat"]] = None
     sequence_progression_mode: Optional[Literal["linear", "dynamic"]] = None
+    dynamic_generation: Optional[dict[str, Any]] = None
     time_per_turn: Optional[int] = None
     pacing_minutes: Optional[int] = None
     clock_enabled: Optional[bool] = None
@@ -674,6 +688,7 @@ class AdventureTemplateUpdate(BaseModel):
     selected_image_styles: Optional[list[dict[str, Any]]] = None
     selected_tone: Optional[dict[str, Any]] = None
     narrator_voice: Optional[dict[str, Any]] = None
+    audio_enabled: Optional[bool] = None
     ui_theme: Optional[dict[str, Any]] = None
     min_scenes: Optional[int] = None
     max_scenes: Optional[int] = None

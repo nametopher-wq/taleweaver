@@ -58,6 +58,8 @@ _FIX_SCENE_FIELDS = frozenset(
         "label",
         "description",
         "decorative_objects",
+        "audio_track_id",
+        "is_respawn_point",
         *SCENE_SCRIPT_FIELDS,
     }
 )
@@ -84,8 +86,8 @@ _FIX_NPC_FIELDS = frozenset(
         "is_killable",
         "current_scene_id",
         "is_hidden",
-        "reveal_rule",
         "spatial_position",
+        "memory_slots",
         *NPC_SCRIPT_FIELDS,
     }
 )
@@ -97,6 +99,7 @@ _FIX_OBJECT_FIELDS = frozenset(
         "is_portable",
         "current_scene_id",
         "locked",
+        "quest_item",
         "code_to_unlock",
         "item_to_unlock",
         "rule_to_unlock",

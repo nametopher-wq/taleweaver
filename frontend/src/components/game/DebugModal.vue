@@ -5,6 +5,7 @@
  * Bundles all session debugging tools into a single cohesive interface:
  * 1. NPCs Overview: All NPCs with real-time stats, health bars, locations, and actions (heal, kill, unhide, drop).
  * 2. World Map: Complete DAGRE layout unmasked by fog-of-war, with NPC indicators/icons on every node where NPCs reside.
+ *    Clicking a scene teleports the hero there (/debug goto); lock badges on locked passages unlock them (/debug open_exit).
  * 3. Items Table: Full matrix of all items across player inventory, scenes, containers, and NPCs with states & locations.
  * 4. Diagnostics: Session runtime, exit locks, quick command triggers, and raw JSON tree.
  */
@@ -42,6 +43,7 @@ import {
   Swords,
   Layers,
 } from 'lucide-vue-next'
+import DebugDownloadButton from '@/components/game/debug/DebugDownloadButton.vue'
 
 const props = defineProps<{
   open: boolean
@@ -64,6 +66,8 @@ const activeTab = ref<DebugTab>('npcs')
 const sessionDebug = computed(() => props.data?.fullWorld || null)
 const sheet = computed(() => props.data?.sheet || null)
 const currentSceneId = computed(() => sessionDebug.value?.session?.current_scene_id || sheet.value?.scene_id || '')
+/** Session id for the debug downloads (images ZIP, .twe export). */
+const debugGameId = computed(() => String(sessionDebug.value?.session?.id || sheet.value?.session_id || ''))
 
 // --- Quick Command Execution Helper ---
 const commandBusy = ref(false)
@@ -176,6 +180,7 @@ const isPanning = ref(false)
 const lastMousePos = ref({ x: 0, y: 0 })
 const hoveredNode = ref<any | null>(null)
 const selectedNode = ref<any | null>(null)
+const dynamicSceneModalNode = ref<any | null>(null)
 const margin = 80
 
 const sceneNpcsMap = computed<Record<string, any[]>>(() => {
@@ -211,6 +216,9 @@ const mapLayoutData = ref<{
     imageUrl: string | null
     description: string
     npcs: any[]
+    dynamicZone: Record<string, any> | null
+    isDynamic: boolean
+    isMaterialized: boolean
   }>
   edges: Array<{
     from: string
@@ -218,6 +226,8 @@ const mapLayoutData = ref<{
     points: Array<{ x: number; y: number }>
     label: string
     isLocked: boolean
+    isBidirectional: boolean
+    exitId: string
   }>
   width: number
   height: number
@@ -260,13 +270,20 @@ function updateMapLayout() {
     props.mapData?.edges ||
     []
 
+  const exitDynZoneByTarget: Record<string, Record<string, any>> = {}
   rawEdges.forEach((e: any) => {
     const from = safeId(e.from_scene_id || e.from)
     const to = safeId(e.to_scene_id || e.to)
+    if (e.dynamic_zone && to && !exitDynZoneByTarget[to]) {
+      exitDynZoneByTarget[to] = e.dynamic_zone
+    }
+    const isBidirectional = String(e.exit_type || '').toLowerCase() === 'bidirectional'
     if (g.hasNode(from) && g.hasNode(to)) {
       g.setEdge(from, to, {
         label: e.label || '',
         isLocked: !!e.is_locked,
+        isBidirectional,
+        exitId: String(e.id || ''),
       })
     }
   })
@@ -282,6 +299,9 @@ function updateMapLayout() {
     const origKey = sceneKeys.find((k) => safeId(k) === sid) || sid
     const orig = rawNodes[origKey] || {}
     const npcsAtNode = npcsLookup[sid] || npcsLookup[origKey] || []
+    const dynamicZone = orig.dynamic_zone || exitDynZoneByTarget[sid] || null
+    const isDynamic = Boolean(dynamicZone) || String(origKey).toUpperCase().startsWith('DYN_')
+    const isMaterialized = Boolean(dynamicZone?.materialized)
 
     return {
       id: sid,
@@ -295,6 +315,9 @@ function updateMapLayout() {
       imageUrl: orig.image_url || null,
       description: orig.description || '',
       npcs: npcsAtNode,
+      dynamicZone,
+      isDynamic,
+      isMaterialized,
     }
   })
 
@@ -306,6 +329,8 @@ function updateMapLayout() {
       points: edge.points || [],
       label: edge.label || '',
       isLocked: !!edge.isLocked,
+      isBidirectional: !!edge.isBidirectional,
+      exitId: edge.exitId || '',
     }
   })
 
@@ -342,14 +367,23 @@ function resetMapView() {
   centerOnCurrentScene()
 }
 
+// A pan that moved the map must not count as a click on a node or lock badge.
+const panStart = ref({ x: 0, y: 0 })
+const panMoved = ref(false)
+
 function startPan(e: MouseEvent) {
   if (e.button !== 0) return
   isPanning.value = true
+  panMoved.value = false
+  panStart.value = { x: e.clientX, y: e.clientY }
   lastMousePos.value = { x: e.clientX, y: e.clientY }
 }
 
 function onPan(e: MouseEvent) {
   if (!isPanning.value) return
+  if (Math.hypot(e.clientX - panStart.value.x, e.clientY - panStart.value.y) > 4) {
+    panMoved.value = true
+  }
   const dx = e.clientX - lastMousePos.value.x
   const dy = e.clientY - lastMousePos.value.y
   offset.value.x += dx
@@ -359,6 +393,73 @@ function onPan(e: MouseEvent) {
 
 function endPan() {
   isPanning.value = false
+}
+
+/** Clicking a dynamic scene opens its configuration/content inspector; regular scenes teleport the hero (/debug goto). */
+function onNodeClick(node: any) {
+  if (panMoved.value) return
+  if (node.isDynamic) {
+    dynamicSceneModalNode.value = node
+    return
+  }
+  selectedNode.value = node
+  if (node.isCurrent || commandBusy.value) return
+  void runCmd(`/debug goto ${node.rawId}`)
+}
+
+const dynamicSceneInspectorData = computed(() => {
+  const node = dynamicSceneModalNode.value
+  if (!node) return null
+  const cfg = node.dynamicZone || {}
+  const isMaterialized = Boolean(node.isMaterialized)
+  const sceneIdSafe = node.id
+
+  const npcs = isMaterialized
+    ? allNpcs.value.filter((n) => safeId(n.current_scene_id || n.start_scene_id || '') === sceneIdSafe)
+    : []
+
+  const sceneItems = isMaterialized
+    ? allItems.value.filter(
+        (itm) => itm.location_type === 'scene' && safeId(itm.location_id || '') === sceneIdSafe
+      )
+    : []
+
+  const containers = sceneItems
+    .filter((itm) => String(itm.item_type || '').toUpperCase() === 'CONTAINER')
+    .map((container) => ({
+      ...container,
+      containedItems: allItems.value.filter(
+        (c) => c.location_type === 'container' && safeId(c.location_id || '') === safeId(container.id || '')
+      ),
+    }))
+
+  const items = sceneItems.filter((itm) => String(itm.item_type || '').toUpperCase() !== 'CONTAINER')
+
+  return {
+    node,
+    config: cfg,
+    isMaterialized,
+    npcs: npcs.length ? npcs : isMaterialized ? node.npcs || [] : [],
+    containers,
+    items,
+  }
+})
+
+function edgeMidpoint(edge: { points: Array<{ x: number; y: number }> }): { x: number; y: number } {
+  const pts = edge.points
+  if (pts.length % 2 === 1) return pts[(pts.length - 1) / 2]
+  const a = pts[pts.length / 2 - 1]
+  const b = pts[pts.length / 2]
+  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+}
+
+const unlockableEdges = computed(() =>
+  (mapLayoutData.value?.edges || []).filter((edge) => edge.isLocked && edge.exitId && edge.points.length > 0)
+)
+
+function unlockEdge(edge: { exitId: string }) {
+  if (panMoved.value || commandBusy.value) return
+  void runCmd(`/debug open_exit ${edge.exitId}`)
 }
 
 function onWheel(e: WheelEvent) {
@@ -475,6 +576,15 @@ watch(
   }
 )
 
+// Commands reload the world data; keep the map in sync with it.
+watch(sessionDebug, () => {
+  if (props.open && activeTab.value === 'map') {
+    nextTick(() => {
+      updateMapLayout()
+    })
+  }
+})
+
 watch(activeTab, (tab) => {
   if (tab === 'map') {
     nextTick(() => {
@@ -564,6 +674,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 <span>Diagnostics</span>
               </button>
             </div>
+
+            <!-- All session images (incl. dynamic scenes / spawns) as ZIP -->
+            <DebugDownloadButton
+              v-if="debugGameId"
+              :game-id="debugGameId"
+              label="Images ZIP"
+              class="hidden sm:inline-flex"
+            />
 
             <!-- Close Button -->
             <button
@@ -713,7 +831,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                           {{ npc.is_alive ? 'Alive' : 'Defeated' }}
                         </span>
                       </div>
-                      <div class="text-[10px] text-slate-400 font-mono truncate mt-0.5">ID: {{ npc.id }}</div>
+                      <div class="flex items-center gap-1.5 mt-0.5">
+                        <div class="text-[10px] text-slate-400 font-mono truncate">ID: {{ npc.id }}</div>
+                        <DebugDownloadButton v-if="debugGameId" :game-id="debugGameId" :entity-id="npc.id" compact />
+                      </div>
 
                       <!-- Location & Movement Badges -->
                       <div class="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
@@ -896,7 +1017,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <div class="absolute bottom-4 left-4 z-30 flex items-center gap-3 bg-slate-900/90 backdrop-blur-md px-3.5 py-2 rounded-2xl border border-slate-800 text-xs text-slate-400 font-mono shadow-xl">
                 <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-400 ring-2 ring-amber-400/40"></span> Hero Position</span>
                 <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span> NPC(s) Present</span>
-                <span class="flex items-center gap-1.5"><Lock class="w-3 h-3 text-red-400" /> Locked Passage</span>
+                <span class="flex items-center gap-1.5"><Lock class="w-3 h-3 text-red-400" /> Locked Passage (click to unlock)</span>
+                <span class="hidden sm:inline text-slate-500">Click a scene to go there</span>
               </div>
 
               <!-- Selected Node Detail Popover -->
@@ -1001,6 +1123,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                           :stroke="edge.isLocked ? '#ef4444' : '#0891b2'"
                           :stroke-width="edge.isLocked ? 2 : 2.5"
                           :stroke-dasharray="edge.isLocked ? '4 3' : 'none'"
+                          :marker-start="edge.isBidirectional ? (edge.isLocked ? 'url(#debug-arrow-locked)' : 'url(#debug-arrow)') : 'none'"
                           :marker-end="edge.isLocked ? 'url(#debug-arrow-locked)' : 'url(#debug-arrow)'"
                           class="opacity-75"
                         />
@@ -1027,8 +1150,17 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                         width: `${node.width}px`,
                         height: `${node.height}px`,
                       }"
-                      @click="selectedNode = node"
+                      :title="node.isDynamic ? `Inspect dynamic scene: ${node.label}` : (node.isCurrent ? node.label : `Go to ${node.label}`)"
+                      @click="onNodeClick(node)"
                     >
+                      <!-- Dynamic Scene Badge -->
+                      <div
+                        v-if="node.isDynamic && !node.isCurrent"
+                        class="absolute -top-2.5 left-3 z-30 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider shadow-md border"
+                        :class="node.isMaterialized ? 'bg-emerald-500/90 text-slate-950 border-emerald-200' : 'bg-amber-500/90 text-slate-950 border-amber-200'"
+                      >
+                        {{ node.isMaterialized ? 'DYN · Generated' : 'DYN · Pending' }}
+                      </div>
                       <!-- CRITICAL: NPC Indicator Badge on Node -->
                       <div
                         v-if="node.npcs?.length"
@@ -1075,6 +1207,23 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                         </div>
                       </div>
                     </div>
+
+                    <!-- Unlock badges on locked passages -->
+                    <button
+                      v-for="edge in unlockableEdges"
+                      :key="`unlock-${edge.exitId}`"
+                      type="button"
+                      class="absolute z-20 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center w-7 h-7 rounded-full bg-slate-950 border-2 border-red-400 text-red-300 shadow-lg hover:bg-red-500 hover:text-white hover:border-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+                      :style="{
+                        left: `${edgeMidpoint(edge).x + margin}px`,
+                        top: `${edgeMidpoint(edge).y + margin}px`,
+                      }"
+                      :disabled="commandBusy"
+                      :title="`Unlock ${edge.label || 'passage'} (${edge.exitId})`"
+                      @click.stop="unlockEdge(edge)"
+                    >
+                      <Lock class="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1189,7 +1338,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
                       <!-- ID -->
                       <td class="py-3 px-4 font-mono text-[11px] text-slate-400">
-                        <span class="bg-slate-950/80 px-2 py-0.5 rounded border border-slate-800">{{ item.id }}</span>
+                        <div class="flex items-center gap-1.5">
+                          <span class="bg-slate-950/80 px-2 py-0.5 rounded border border-slate-800">{{ item.id }}</span>
+                          <DebugDownloadButton
+                            v-if="debugGameId && item.id"
+                            :game-id="debugGameId"
+                            :entity-id="item.id"
+                            compact
+                          />
+                        </div>
                       </td>
 
                       <!-- Type -->
@@ -1395,6 +1552,296 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               </div>
             </section>
           </main>
+        </div>
+
+        <!-- Dynamic Scene Inspector Popup Dialog -->
+        <div
+          v-if="dynamicSceneInspectorData"
+          class="fixed inset-0 z-[130] flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm"
+          @click.self="dynamicSceneModalNode = null"
+        >
+          <div class="w-full max-w-3xl max-h-[85vh] flex flex-col bg-slate-900 border border-cyan-500/40 rounded-2xl shadow-2xl overflow-hidden text-slate-200">
+            <!-- Header -->
+            <div class="flex items-start justify-between gap-4 px-5 py-4 bg-slate-950/90 border-b border-slate-800 shrink-0">
+              <div class="min-w-0">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <h3 class="text-base font-black text-white truncate">{{ dynamicSceneInspectorData.node.label }}</h3>
+                  <span
+                    class="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider"
+                    :class="dynamicSceneInspectorData.isMaterialized ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'"
+                  >
+                    {{ dynamicSceneInspectorData.isMaterialized ? 'Generated' : 'Not Generated Yet' }}
+                  </span>
+                </div>
+                <div class="text-xs font-mono text-slate-400 mt-0.5">{{ dynamicSceneInspectorData.node.rawId }}</div>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <button
+                  v-if="dynamicSceneInspectorData.isMaterialized && !dynamicSceneInspectorData.node.isCurrent"
+                  type="button"
+                  :disabled="commandBusy"
+                  @click="runCmd(`/debug goto ${dynamicSceneInspectorData.node.rawId}`); dynamicSceneModalNode = null"
+                  class="px-3 py-1.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 text-xs font-bold transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  Teleport Here
+                </button>
+                <button
+                  type="button"
+                  @click="dynamicSceneModalNode = null"
+                  class="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                  aria-label="Close dynamic scene inspector"
+                >
+                  <X class="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <!-- Body -->
+            <div class="flex-1 overflow-y-auto p-5 space-y-5 custom-scrollbar">
+              <!-- Notice when not yet materialized -->
+              <div
+                v-if="!dynamicSceneInspectorData.isMaterialized"
+                class="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200"
+              >
+                This dynamic scene has not been generated yet. Only its dynamic zone configuration is shown.
+              </div>
+
+              <!-- Dynamic Zone Configuration (Always Shown) -->
+              <div class="space-y-3">
+                <h4 class="text-[11px] font-black uppercase tracking-[0.18em] text-cyan-400">
+                  Dynamic Scene Configuration
+                </h4>
+
+                <div class="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 space-y-3">
+                  <div>
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">Theme</div>
+                    <div class="text-xs text-slate-100 leading-relaxed whitespace-pre-wrap">
+                      {{ dynamicSceneInspectorData.config.theme || '—' }}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div class="flex items-center justify-between gap-2 mb-1">
+                      <span class="text-[10px] font-bold uppercase tracking-wider text-slate-400">Generation Instructions</span>
+                      <span v-if="dynamicSceneInspectorData.config.instructions_source === 'cluster_blueprint'" class="text-[10px] font-mono text-emerald-300">
+                        room brief (cluster blueprint)
+                      </span>
+                      <span v-else-if="dynamicSceneInspectorData.config.instructions_scope" class="text-[10px] font-mono text-cyan-300">
+                        scope: {{ dynamicSceneInspectorData.config.instructions_scope }}
+                      </span>
+                    </div>
+                    <div class="text-xs text-slate-200 leading-relaxed whitespace-pre-wrap">
+                      {{ dynamicSceneInspectorData.config.instructions || '—' }}
+                    </div>
+                  </div>
+
+                  <div v-if="dynamicSceneInspectorData.config.cluster_node?.story_beat">
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                      Room Story Beat ({{ dynamicSceneInspectorData.config.cluster_node.role }})
+                    </div>
+                    <div class="text-xs text-slate-300 leading-relaxed whitespace-pre-wrap">
+                      {{ dynamicSceneInspectorData.config.cluster_node.story_beat }}
+                    </div>
+                  </div>
+
+                  <details
+                    v-if="dynamicSceneInspectorData.config.root_theme && dynamicSceneInspectorData.config.root_theme !== dynamicSceneInspectorData.config.theme"
+                    class="text-xs"
+                  >
+                    <summary class="cursor-pointer text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                      Zone base (author)
+                    </summary>
+                    <div class="mt-1.5 space-y-1.5 text-slate-400 whitespace-pre-wrap">
+                      <div><span class="text-slate-500">Theme:</span> {{ dynamicSceneInspectorData.config.root_theme }}</div>
+                      <div v-if="dynamicSceneInspectorData.config.root_instructions">
+                        <span class="text-slate-500">Instructions ({{ dynamicSceneInspectorData.config.root_instructions_scope || 'once' }}):</span>
+                        {{ dynamicSceneInspectorData.config.root_instructions }}
+                      </div>
+                    </div>
+                  </details>
+                </div>
+
+                <!-- Settings Grid -->
+                <div class="grid grid-cols-2 sm:grid-cols-3 gap-2.5 text-xs">
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Zone ID</div>
+                    <div class="font-mono text-slate-100 mt-0.5 truncate">{{ dynamicSceneInspectorData.config.zone_id || '—' }}</div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Depth / Max Depth</div>
+                    <div class="font-mono text-slate-100 mt-0.5">
+                      {{ dynamicSceneInspectorData.config.depth ?? '—' }} / {{ dynamicSceneInspectorData.config.max_depth ?? '—' }}
+                    </div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Danger Level</div>
+                    <div class="font-mono text-slate-100 mt-0.5">{{ dynamicSceneInspectorData.config.danger_level ?? '—' }}</div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Max NPCs</div>
+                    <div class="font-mono text-slate-100 mt-0.5">{{ dynamicSceneInspectorData.config.max_npcs ?? '—' }}</div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Generation Model</div>
+                    <div class="font-mono text-slate-100 mt-0.5 truncate">{{ dynamicSceneInspectorData.config.generation_model || 'default' }}</div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Audio Mode</div>
+                    <div class="font-mono text-slate-100 mt-0.5">{{ dynamicSceneInspectorData.config.audio_mode || 'global' }}</div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Cluster Consistency</div>
+                    <div class="font-mono text-slate-100 mt-0.5">
+                      {{ dynamicSceneInspectorData.config.cluster_consistency === false ? 'Disabled' : 'Enabled' }}
+                    </div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Cul-de-sac on Max Depth</div>
+                    <div class="font-mono text-slate-100 mt-0.5">
+                      {{ dynamicSceneInspectorData.config.cul_de_sac_on_max_depth ? 'Yes' : 'No' }}
+                    </div>
+                  </div>
+                  <div class="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] uppercase text-slate-500 font-bold">Cluster Node</div>
+                    <div class="font-mono text-slate-100 mt-0.5">
+                      {{ dynamicSceneInspectorData.config.cluster_node ? 'Yes' : 'No' }}
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Spawn Chances & NPC Type Caps -->
+                <div
+                  v-if="dynamicSceneInspectorData.config.spawn_chances || dynamicSceneInspectorData.config.npc_type_caps"
+                  class="grid grid-cols-1 sm:grid-cols-2 gap-3"
+                >
+                  <div v-if="dynamicSceneInspectorData.config.spawn_chances" class="p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">Spawn Chances</div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <span
+                        v-for="(val, key) in dynamicSceneInspectorData.config.spawn_chances"
+                        :key="String(key)"
+                        class="px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-700 text-[11px] font-mono text-slate-200"
+                      >
+                        {{ key }}: {{ val }}
+                      </span>
+                    </div>
+                  </div>
+                  <div v-if="dynamicSceneInspectorData.config.npc_type_caps" class="p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">NPC Type Caps</div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <span
+                        v-for="(val, key) in dynamicSceneInspectorData.config.npc_type_caps"
+                        :key="String(key)"
+                        class="px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-700 text-[11px] font-mono text-slate-200"
+                      >
+                        {{ key }}: {{ val }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- On After Generated Script -->
+                <div
+                  v-if="dynamicSceneInspectorData.config.on_after_generated_script"
+                  class="p-3 rounded-xl bg-slate-950/70 border border-slate-800"
+                >
+                  <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">After Generated Script</div>
+                  <pre class="text-[11px] font-mono text-cyan-300 overflow-x-auto whitespace-pre-wrap leading-relaxed">{{ dynamicSceneInspectorData.config.on_after_generated_script }}</pre>
+                </div>
+              </div>
+
+              <!-- Generated Scene Contents (ONLY shown when materialized) -->
+              <template v-if="dynamicSceneInspectorData.isMaterialized">
+                <div v-if="dynamicSceneInspectorData.node.description" class="space-y-2 border-t border-slate-800 pt-4">
+                  <h4 class="text-[11px] font-black uppercase tracking-[0.18em] text-cyan-400">Scene Description</h4>
+                  <p class="text-xs text-slate-300 leading-relaxed whitespace-pre-wrap">{{ dynamicSceneInspectorData.node.description }}</p>
+                </div>
+
+                <!-- Items -->
+                <div class="space-y-2 border-t border-slate-800 pt-4">
+                  <h4 class="text-[11px] font-black uppercase tracking-[0.18em] text-cyan-400">
+                    Items ({{ dynamicSceneInspectorData.items.length }})
+                  </h4>
+                  <div v-if="dynamicSceneInspectorData.items.length" class="space-y-2">
+                    <div
+                      v-for="item in dynamicSceneInspectorData.items"
+                      :key="item.id"
+                      class="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 text-xs"
+                    >
+                      <div class="flex items-center justify-between gap-2">
+                        <span class="font-bold text-white">{{ item.name }}</span>
+                        <div class="flex items-center gap-1.5 text-[10px] font-mono">
+                          <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">{{ item.item_type }}</span>
+                          <span v-if="item.is_hidden" class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">Hidden</span>
+                        </div>
+                      </div>
+                      <div class="text-[10px] font-mono text-slate-500">{{ item.id }}</div>
+                      <p v-if="item.description" class="text-slate-300 mt-1">{{ item.description }}</p>
+                    </div>
+                  </div>
+                  <div v-else class="text-xs text-slate-500 italic">No loose items in this scene.</div>
+                </div>
+
+                <!-- Containers -->
+                <div class="space-y-2 border-t border-slate-800 pt-4">
+                  <h4 class="text-[11px] font-black uppercase tracking-[0.18em] text-cyan-400">
+                    Containers ({{ dynamicSceneInspectorData.containers.length }})
+                  </h4>
+                  <div v-if="dynamicSceneInspectorData.containers.length" class="space-y-2">
+                    <div
+                      v-for="container in dynamicSceneInspectorData.containers"
+                      :key="container.id"
+                      class="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 text-xs space-y-1.5"
+                    >
+                      <div class="flex items-center justify-between gap-2">
+                        <span class="font-bold text-white">{{ container.name }}</span>
+                        <span class="text-[10px] font-mono text-slate-400">{{ container.containedItems.length }} item(s)</span>
+                      </div>
+                      <div class="text-[10px] font-mono text-slate-500">{{ container.id }}</div>
+                      <p v-if="container.description" class="text-slate-300">{{ container.description }}</p>
+                      <div v-if="container.containedItems.length" class="pl-3 border-l border-slate-700 space-y-1 pt-1">
+                        <div
+                          v-for="cItem in container.containedItems"
+                          :key="cItem.id"
+                          class="flex items-center justify-between gap-2 text-[11px] text-slate-200"
+                        >
+                          <span>{{ cItem.name }}</span>
+                          <span class="text-[10px] font-mono text-slate-400">{{ cItem.item_type }}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else class="text-xs text-slate-500 italic">No containers in this scene.</div>
+                </div>
+
+                <!-- NPCs -->
+                <div class="space-y-2 border-t border-slate-800 pt-4">
+                  <h4 class="text-[11px] font-black uppercase tracking-[0.18em] text-cyan-400">
+                    NPCs ({{ dynamicSceneInspectorData.npcs.length }})
+                  </h4>
+                  <div v-if="dynamicSceneInspectorData.npcs.length" class="space-y-2">
+                    <div
+                      v-for="npc in dynamicSceneInspectorData.npcs"
+                      :key="npc.id"
+                      class="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 text-xs"
+                    >
+                      <div class="flex items-center justify-between gap-2">
+                        <span class="font-bold text-white">{{ npc.name }}</span>
+                        <div class="flex items-center gap-1.5 text-[10px] font-mono">
+                          <span class="text-emerald-400">{{ npc.hp }}/{{ npc.max_hp }} HP</span>
+                          <span v-if="npc.is_hidden" class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">Hidden</span>
+                          <span v-if="npc.is_alive === false" class="px-1.5 py-0.5 rounded bg-red-500/20 text-red-300">Dead</span>
+                        </div>
+                      </div>
+                      <div class="text-[10px] font-mono text-slate-500">{{ npc.id }}</div>
+                      <p v-if="npc.notes" class="text-slate-300 mt-1">{{ npc.notes }}</p>
+                    </div>
+                  </div>
+                  <div v-else class="text-xs text-slate-500 italic">No NPCs in this scene.</div>
+                </div>
+              </template>
+            </div>
+          </div>
         </div>
       </div>
     </Transition>

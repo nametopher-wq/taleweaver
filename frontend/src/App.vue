@@ -7,6 +7,9 @@ import { api } from '@/composables/useApi'
 import { isPublicRoute } from '@/router'
 import GlobalHeader from '@/components/GlobalHeader.vue'
 import SetupWizardModal from '@/components/setup-wizard/SetupWizardModal.vue'
+import BackendStatusBanner from '@/components/common/BackendStatusBanner.vue'
+import UiDialogHost from '@/components/ui/UiDialogHost.vue'
+import UiToastHost from '@/components/ui/UiToastHost.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -111,6 +114,9 @@ onUnmounted(() => {
       <RouterView />
     </main>
     <SetupWizardModal />
+    <BackendStatusBanner />
+    <UiDialogHost />
+    <UiToastHost />
   </div>
 </template>
 

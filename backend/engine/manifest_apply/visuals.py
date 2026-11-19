@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -85,10 +86,12 @@ def t2i_config(ctx: ApplyContext) -> tuple[dict, dict]:
     """Returns the (user_config, api_keys) pair every MediaEngine call expects."""
     user = ctx.user
     llm_settings = (user.llm_settings if user else None) or {}
+    keys = user.encrypted_api_keys if user else None
+    # copy.copy keeps EffectiveKeys.sources (the key policy); dict() would drop it.
     return {
         "t2i_settings": user.t2i_settings if user else None,
         **llm_settings,
-    }, dict((user.encrypted_api_keys if user else None) or {})
+    }, copy.copy(keys) if keys else {}
 
 
 def uses_advanced_model(ctx: ApplyContext, setting: str, default: str) -> bool:

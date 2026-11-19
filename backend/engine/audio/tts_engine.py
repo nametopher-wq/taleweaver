@@ -7,6 +7,11 @@ import httpx
 
 from backend.core.config import settings
 from backend.engine.audio.elevenlabs_stream import synthesize_elevenlabs_bytes
+from backend.engine.audio.openai_compatible_tts import (
+    OPENAI_COMPATIBLE_PROVIDER,
+    SpeechEndpoint,
+    synthesize_speech,
+)
 from backend.engine.audio.tts_helpers import (
     TTSModelSwitchSuggestionError,
     TTSProviderError,
@@ -61,7 +66,7 @@ def _parse_sse_audio_response(response: httpx.Response) -> dict:
 
 class TTSEngine:
     """
-    Handles speech generation using Google Gemini TTS or ElevenLabs.
+    Handles speech generation using Google Gemini TTS, ElevenLabs or an OpenAI-compatible server.
     """
 
     @staticmethod
@@ -77,6 +82,7 @@ class TTSEngine:
         model_name: str = "gemini-3.8-flash-tts",
         language: Optional[str] = None,
         use_streaming: bool = False,
+        speech_endpoint: Optional[SpeechEndpoint] = None,
         **_unused_kwargs: object,
     ) -> Optional[str]:
         """
@@ -87,15 +93,24 @@ class TTSEngine:
             provider,
             len(text or ""),
         )
-        if not api_key:
-            logger.error("No API key provided for %s TTS.", provider)
-            return None
-
         safe_session_id = sanitize_path_component(session_id)
         if session_id and not safe_session_id:
             logger.warning(
                 "Invalid session_id for TTS output path; using adventure-level fallback."
             )
+
+        if provider == OPENAI_COMPATIBLE_PROVIDER:
+            # The key is optional here (local servers); it travels inside the endpoint.
+            return await TTSEngine._synthesize_openai_compatible(
+                text=_strip_vocal_tags(text or ""),
+                endpoint=speech_endpoint,
+                adventure_id=adventure_id,
+                session_id=safe_session_id,
+            )
+
+        if not api_key:
+            logger.error("No API key provided for %s TTS.", provider)
+            return None
 
         if provider == "elevenlabs":
             # ElevenLabs model ids use underscores, but some might be sent with dots
@@ -156,6 +171,28 @@ class TTSEngine:
             return None
 
     @staticmethod
+    async def _synthesize_openai_compatible(
+        text: str,
+        endpoint: Optional[SpeechEndpoint],
+        adventure_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """A whole clip from an OpenAI-compatible speech server, stored as a file."""
+        if endpoint is None:
+            raise TTSProviderError("The OpenAI-compatible speech server is not configured.")
+        if not text.strip():
+            return None
+        audio, ext = await synthesize_speech(text, endpoint)
+        if not audio:
+            logger.error("OpenAI-compatible TTS returned zero audio bytes.")
+            return None
+        try:
+            return _write_audio_file(audio, adventure_id, session_id, ext)
+        except (OSError, ValueError):
+            logger.exception("Failed to store OpenAI-compatible TTS audio")
+            return None
+
+    @staticmethod
     def _build_google_payload(text: str, voice: str, language: Optional[str] = None) -> dict:
         _ = language
         return {
@@ -185,6 +222,23 @@ class TTSEngine:
 
             if response.status_code == 429:
                 delay = _compute_429_retry_delay_seconds(response, attempt)
+                resp_text = (response.text or "").lower()
+                is_daily_quota = (
+                    "per_day" in resp_text
+                    or "generaterequestsperday" in resp_text
+                    or (delay is not None and delay > 60)
+                )
+                if is_daily_quota:
+                    logger.warning(
+                        "Gemini TTS daily quota exhausted for %s (delay=%.1fs); aborting retries.",
+                        model_name,
+                        delay or 0.0,
+                    )
+                    raise TTSRateLimitError(
+                        f"Gemini TTS daily quota reached for '{model_name}'.",
+                        retry_after_seconds=delay,
+                    )
+
                 logger.warning(
                     "Gemini TTS rate-limited (429), attempt %d/%d, retrying in %.1fs (model=%s, chars=%d).",
                     attempt,
@@ -268,9 +322,24 @@ class TTSEngine:
             audio_bytes, ext = decoded
             return _write_audio_file(audio_bytes, adventure_id, session_id, ext)
 
+        except TTSRateLimitError:
+            if model_name == "gemini-3.8-flash-tts":
+                logger.info(
+                    "Attempting automatic fallback to gemini-3.8-flash-lite-tts after rate limit / quota exhaustion."
+                )
+                return await TTSEngine._synthesize_google(
+                    text=text,
+                    voice=voice,
+                    api_key=api_key,
+                    adventure_id=adventure_id,
+                    session_id=session_id,
+                    model_name="gemini-3.8-flash-lite-tts",
+                    language=language,
+                    use_streaming=use_streaming,
+                )
+            raise
         except (
             TTSTimeoutError,
-            TTSRateLimitError,
             TTSModelSwitchSuggestionError,
             TTSProviderError,
         ):

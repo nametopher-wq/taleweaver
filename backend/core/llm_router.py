@@ -10,6 +10,7 @@ from typing import Any, Optional, TypeVar
 import litellm
 from pydantic import BaseModel, ValidationError
 
+from backend.core.claude_thinking import apply_claude_thinking, claude_thinking_profile
 from backend.core.llm_errors import LLMTruncatedResponseError, build_truncation_error
 from backend.core.llm_json_repair import (
     attempt_repair_truncated_json,
@@ -24,9 +25,11 @@ from backend.core.llm_provider_config import (
     normalize_model,
     uses_json_mode_fallback,
 )
-from backend.core.llm_request_tuning import apply_prompt_cache_markers
+from backend.core.llm_request_tuning import (
+    apply_prompt_cache_markers,
+    apply_session_cache_routing,
+)
 from backend.core.llm_stream_filters import clean_stream_thinking, clean_stream_voice_tags
-from backend.core.security import encryption_util
 from backend.core.voice_tags import VOICE_TAG_SET
 from backend.models.user import User
 
@@ -62,6 +65,10 @@ UNBRACKETED_RE = re.compile(
 )
 
 
+_OPENING_QUOTES = ('"', "“", "„", "«")
+_CLOSING_QUOTES = ('"', "”", "»", "“")
+
+
 def _clean_dialogue_voice_body(raw_body: str) -> str:
     return (
         raw_body.rstrip('"')
@@ -92,7 +99,14 @@ def _normalize_dialogue_line(
     canon_tag = GameMasterLLM._to_canonical_voice_tag(raw_tag)
     if canon_tag not in VOICE_TAG_SET:
         return line
-    body = _clean_dialogue_voice_body(tag_match.group("body").strip())
+    raw_body = tag_match.group("body").strip()
+    body = _clean_dialogue_voice_body(raw_body)
+    # A streamed prefix can end inside the quote ('"P'); closing it there splits the word.
+    after_tag = speech_part[speech_part.find("]") + 1 : tag_match.start("body")]
+    is_opened = '"' in after_tag or raw_body.startswith(_OPENING_QUOTES)
+    is_closed = len(raw_body) > 1 and raw_body.endswith(_CLOSING_QUOTES)
+    if is_opened and not is_closed:
+        return f'{speaker_part}[{canon_tag}] "{body}'
     return f'{speaker_part}[{canon_tag}] "{body}"'
 
 
@@ -800,6 +814,34 @@ class GameMasterLLM:
         kwargs["messages"] = deepcopy(messages)
         apply_prompt_cache_markers(kwargs["messages"], self.provider, normalized_model)
 
+    _GLM_THINKING_RE = re.compile(r"(?:^|/)glm-(?:4\.[5-9]|5\b|[5-9]\.)", re.I)
+    _GLM_MANDATORY_THINKING_RE = re.compile(r"(?:^|/)glm-[5-9](?:\.|\b|-)", re.I)
+
+    @classmethod
+    def _is_glm_thinking_model(cls, model: str) -> bool:
+        return bool(cls._GLM_THINKING_RE.search((model or "").strip()))
+
+    def _apply_glm_thinking(self, kwargs: dict, enable_thinking: bool) -> None:
+        model_name = str(kwargs.get("model") or "").strip()
+        mandatory = bool(self._GLM_MANDATORY_THINKING_RE.search(model_name))
+        if self._uses_openrouter():
+            extra_body = dict(kwargs.get("extra_body") or {})
+            if enable_thinking:
+                extra_body["reasoning"] = {"enabled": True}
+            elif mandatory:
+                # Endpoints with mandatory reasoning reject {"enabled": False} with HTTP 400.
+                extra_body["reasoning"] = {"effort": "low"}
+                if kwargs.get("max_tokens") is not None:
+                    kwargs["max_tokens"] = int(kwargs["max_tokens"]) + self.max_thinking_tokens
+            else:
+                extra_body["reasoning"] = {"enabled": False}
+            kwargs["extra_body"] = extra_body
+            return
+        if enable_thinking or not mandatory:
+            kwargs["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}
+        elif kwargs.get("max_tokens") is not None:
+            kwargs["max_tokens"] = int(kwargs["max_tokens"]) + self.max_thinking_tokens
+
     def _apply_thinking_settings(self, kwargs: dict) -> None:
         """Inject thinking parameters based on user settings and provider."""
         # MiniMax defaults to thinking-on server-side, so we must explicitly opt-out
@@ -810,21 +852,69 @@ class GameMasterLLM:
             )
             return
 
+        model_name = str(kwargs.get("model") or "")
+        profile = claude_thinking_profile(model_name)
+        if profile is not None and not profile.budget_tokens:
+            # Claude 5.x: thinks by default and rejects budget_tokens.
+            apply_claude_thinking(
+                kwargs,
+                profile,
+                enable_thinking=self.enable_thinking,
+                thinking_tokens=self.max_thinking_tokens,
+                via_openrouter=self._uses_openrouter(),
+            )
+            return
+
+        if self._is_glm_thinking_model(model_name):
+            self._apply_glm_thinking(kwargs, self.enable_thinking)
+            return
+
         if not self.enable_thinking:
             return
 
         # LiteLLM maps 'thinking' to provider-specific params (budget_tokens for Anthropic, etc.)
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": self.max_thinking_tokens}
 
-    def _apply_openrouter_provider_routing(self, kwargs: dict) -> None:
-        """Inject provider routing ordering into OpenRouter requests if configured."""
-        if self.provider == "custom_openai":
+    def _suppress_default_thinking(self, kwargs: dict) -> None:
+        """JSON-mode requests run without thinking; Claude 5.x and GLM-4.5+/5 think unless told otherwise."""
+        model_name = str(kwargs.get("model") or "")
+        if self._is_glm_thinking_model(model_name):
+            self._apply_glm_thinking(kwargs, False)
             return
-        if self.provider != "openrouter" and not (
-            isinstance(self.api_key, str) and self.api_key.startswith("sk-or-v1")
-        ):
+        profile = claude_thinking_profile(model_name)
+        if profile is None or profile.budget_tokens or not profile.on_by_default:
             return
+        apply_claude_thinking(
+            kwargs,
+            profile,
+            enable_thinking=False,
+            thinking_tokens=self.max_thinking_tokens,
+            via_openrouter=self._uses_openrouter(),
+        )
 
+    def _uses_openrouter(self) -> bool:
+        if self.provider == "custom_openai":
+            return False
+        return self.provider == "openrouter" or (
+            isinstance(self.api_key, str) and self.api_key.startswith("sk-or-v1")
+        )
+
+    def _apply_request_routing(self, kwargs: dict) -> None:
+        """Session cache-routing key (OpenRouter / OpenAI) plus OpenRouter provider order."""
+        via_openrouter = self._uses_openrouter()
+        apply_session_cache_routing(
+            kwargs,
+            self.provider,
+            getattr(self, "model_category", "") or "",
+            via_openrouter=via_openrouter,
+        )
+        if via_openrouter:
+            self._apply_openrouter_provider_routing(kwargs)
+
+    def _apply_openrouter_provider_routing(self, kwargs: dict) -> None:
+        """Inject the configured provider order into OpenRouter requests."""
+        if not self._uses_openrouter():
+            return
         if not self.openrouter_provider:
             return
 
@@ -842,19 +932,14 @@ class GameMasterLLM:
         kwargs["extra_body"] = extra_body
 
     def _get_decrypted_key(self, provider: str) -> str:
-        from backend.core.config import settings
+        from backend.core.api_keys import resolve_api_key
 
-        # 1. Check environment variables first (precedence)
-        env_key = settings.get_env_api_key(provider)
-        if env_key:
-            return env_key
-
-        # 2. Fallback to database
-        if not self.user.encrypted_api_keys or provider not in self.user.encrypted_api_keys:
+        # Personal key, env key or stored server key, as the key policy says; raises
+        # PersonalKeyRequiredError when the provider is unavailable for this user.
+        api_key = resolve_api_key(self.user.encrypted_api_keys, provider)
+        if not api_key:
             raise ValueError(f"No API key configured for provider: {provider}")
-
-        encrypted_key = self.user.encrypted_api_keys[provider]
-        return encryption_util.decrypt_key(encrypted_key)
+        return api_key
 
     def _validate_ollama_model(self, model: str) -> None:
         """Ensure local Ollama mode never silently routes to cloud models."""
@@ -922,7 +1007,7 @@ class GameMasterLLM:
             minimax_api_base=self.minimax_api_base,
         )
 
-        self._apply_openrouter_provider_routing(kwargs)
+        self._apply_request_routing(kwargs)
 
         log_structured_event(
             "gm.turn.request",
@@ -1000,7 +1085,7 @@ class GameMasterLLM:
             minimax_api_base=self.minimax_api_base,
         )
 
-        self._apply_openrouter_provider_routing(kwargs)
+        self._apply_request_routing(kwargs)
 
         log_structured_event(
             "gm.turn.request",
@@ -1085,7 +1170,7 @@ class GameMasterLLM:
             minimax_api_base=self.minimax_api_base,
         )
 
-        self._apply_openrouter_provider_routing(kwargs)
+        self._apply_request_routing(kwargs)
 
         log_structured_event(
             "gm.turn.stream.request",
@@ -1149,6 +1234,8 @@ class GameMasterLLM:
             kwargs["response_format"] = response_format
         if not json_mode:
             self._apply_thinking_settings(kwargs)
+        else:
+            self._suppress_default_thinking(kwargs)
         if self.provider == "ollama":
             self._validate_ollama_model(model)
         apply_provider_endpoint(
@@ -1159,7 +1246,7 @@ class GameMasterLLM:
             kimi_api_base=self.kimi_api_base,
             minimax_api_base=self.minimax_api_base,
         )
-        self._apply_openrouter_provider_routing(kwargs)
+        self._apply_request_routing(kwargs)
         self._prepare_cacheable_messages(kwargs, normalized_model)
         return _StructuredRequest(kwargs, normalized_model, json_mode, system_prompt)
 

@@ -11,31 +11,30 @@ from backend.models.avatar import Avatar
 from backend.models.game_session import GameSession
 from backend.models.user import User
 from tests.conftest import TestSessionLocal
+from tests.server_settings_helpers import seed_server_settings
 
 pytestmark = pytest.mark.asyncio
 
 
 async def _enable_tts_for_test_user(api_key: str = "test-api-key", **overrides: object) -> None:
-    """Enable TTS for the seeded test user with valid settings (Gemini unless overridden)."""
+    """Enable TTS server-wide with valid settings (Gemini unless overridden)."""
+    tts_settings = {
+        "enabled": True,
+        "provider": "google",
+        "selected_model": "gemini-3.8-flash-tts",
+        "selected_voice": "Puck",
+        "use_vocal_tags": True,
+        "speech_rate": 1.0,
+        "elevenlabs_voice_id": "",
+        **overrides,
+    }
+    provider = str(tts_settings["provider"])
     async with TestSessionLocal() as session:
-        user = (
-            (await session.execute(select(User).where(User.username == "test_user")))
-            .scalars()
-            .first()
+        await seed_server_settings(
+            session,
+            tts_settings=tts_settings,
+            encrypted_api_keys={provider: encryption_util.encrypt_key(api_key)},
         )
-        assert user is not None
-        user.tts_settings = {
-            "enabled": True,
-            "provider": "google",
-            "selected_model": "gemini-3.8-flash-tts",
-            "selected_voice": "Puck",
-            "use_vocal_tags": True,
-            "speech_rate": 1.0,
-            "elevenlabs_voice_id": "",
-            **overrides,
-        }
-        provider = str(user.tts_settings["provider"])
-        user.encrypted_api_keys = {provider: encryption_util.encrypt_key(api_key)}
         await session.commit()
 
 
@@ -295,7 +294,7 @@ async def test_tts_invalid_session_id_falls_back_to_global_audio_folder(tmp_path
 async def test_gemini_always_uses_the_narrator_voice(
     auth_client: AsyncClient, monkeypatch, voice_override
 ):
-    """Per-character voices are an ElevenLabs feature; Gemini ignores NPC voice overrides."""
+    """Without a voice mapping Gemini speaks every character in the narrator voice."""
     # Arrange
     await _enable_tts_for_test_user()
     captured: dict = {}
@@ -353,7 +352,7 @@ async def test_elevenlabs_applies_npc_voice_ids(
 
 @pytest.mark.asyncio
 async def test_voices_endpoint_always_lists_voices_but_flags_elevenlabs(auth_client: AsyncClient):
-    """Voices can be assigned under Gemini too; only ElevenLabs speaks them."""
+    """Voices can be assigned under Gemini too; Google speaks the suggested or mapped voices."""
     # Arrange
     await _enable_tts_for_test_user()
 
@@ -361,9 +360,10 @@ async def test_voices_endpoint_always_lists_voices_but_flags_elevenlabs(auth_cli
     gemini = await auth_client.get("/api/tts/voices")
     eleven = await auth_client.get("/api/tts/voices", params={"provider": "elevenlabs"})
 
-    # Assert
+    # Assert (the bundled list suggests Google voices until an admin saves a mapping)
     assert gemini.json()["provider"] == "google"
-    assert gemini.json()["supports_npc_voices"] is False
+    assert gemini.json()["supports_npc_voices"] is True
+    assert gemini.json()["provider_voices"]
     assert gemini.json()["voices"] == eleven.json()["voices"]
     assert eleven.json()["supports_npc_voices"] is True
     assert eleven.json()["voices"]
@@ -458,3 +458,47 @@ async def test_tts_provider_error_propagates_to_http_502(auth_client: AsyncClien
     resp = await auth_client.post("/api/tts/generate", json={"text": "Fail test", "language": "de"})
     assert resp.status_code == 502
     assert "Google TTS error" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_google_tts_daily_quota_falls_back_to_lite(monkeypatch):
+    """When gemini-3.8-flash-tts hits rate limit/quota, it automatically falls back to flash-lite."""
+    from backend.engine.audio.tts_engine import TTSEngine, TTSRateLimitError
+
+    attempted_models = []
+
+    async def fake_post(client, url, payload, timeout, model_name, text_length):
+        attempted_models.append(model_name)
+        if model_name == "gemini-3.8-flash-tts":
+            raise TTSRateLimitError("Quota exceeded", retry_after_seconds=50000)
+        import httpx
+
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"inlineData": {"data": "UklGRg==", "mimeType": "audio/wav"}}]
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(TTSEngine, "_post_google_with_retries", fake_post)
+    monkeypatch.setattr(
+        "backend.engine.audio.tts_engine._write_audio_file",
+        lambda bytes_, adv, sess, ext: "/mock/audio.wav",
+    )
+
+    result = await TTSEngine._synthesize_google(
+        text="Hello world",
+        voice="Puck",
+        api_key="mock_key",
+        adventure_id="adv1",
+        session_id="sess1",
+        model_name="gemini-3.8-flash-tts",
+    )
+    assert result == "/mock/audio.wav"
+    assert attempted_models == ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"]

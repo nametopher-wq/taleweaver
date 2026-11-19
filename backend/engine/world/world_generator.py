@@ -21,6 +21,7 @@ from typing import Any, Literal, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.adventure_identity import new_origin_id
+from backend.core.api_keys import PersonalKeyRequiredError, has_api_key, is_blocked, key_source
 from backend.core.config import settings
 from backend.core.llm_logger import log_structured_event
 from backend.core.llm_router import GameMasterLLM
@@ -43,7 +44,7 @@ from backend.engine.world.world_schemas import (  # noqa: F401
 from backend.models.adventure_template import AdventureTemplate, GenerationCancelled
 from backend.models.user import User
 from backend.utils.path_security import sanitize_path_component
-from backend.utils.text_utils import slugify
+from backend.utils.text_utils import slugify, unescape_line_breaks
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +84,10 @@ def _image_generation_timeout_seconds() -> float:
 def _check_image_provider_credentials(provider: str, user: User, model_type: str) -> None:
     if provider in ("ollama", "stable_diffusion"):
         return
-    if settings.get_env_api_key(provider):
-        return
-    encrypted_api_keys = user.encrypted_api_keys or {}
-    if provider not in encrypted_api_keys:
+    keys = user.encrypted_api_keys or {}
+    if is_blocked(keys, provider):
+        raise PersonalKeyRequiredError(provider, key_source(keys, provider))
+    if not has_api_key(keys, provider):
         raise ValueError(f"API key missing for {model_type} image provider '{provider}'.")
 
 
@@ -238,7 +239,7 @@ def _normalize_text_log_content(
     content = str(raw_content or "")
     if not content.strip():
         content = str(description_fallback or "")
-    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    content = unescape_line_breaks(content).replace("\r\n", "\n").replace("\r", "\n")
     normalized_lines = [line.rstrip() for line in content.split("\n")]
     normalized = "\n".join(normalized_lines).strip()
     if not normalized:
