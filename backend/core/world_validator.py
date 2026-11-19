@@ -14,7 +14,10 @@ from typing import Any
 from backend.core.script_validator import check_scripts_and_guards
 from backend.core.world_validation import (
     combat_groups,
+    companions,
     entities,
+    hidden_npcs,
+    npc_memory,
     progression,
     recipes,
     story,
@@ -44,7 +47,11 @@ CHECKS: tuple[Check, ...] = (
     entities.check_npc_references,
     entities.check_npc_combat_profile,
     combat_groups.check_lonely_combat_groups,
+    companions.check_starting_companions,
+    companions.check_recruit_items,
     entities.check_reveal_targets,
+    hidden_npcs.check_hidden_npc_reveal,
+    npc_memory.check_hostile_npc_memory,
     entities.check_protagonist_items,
     story.check_image_coverage,
     story.check_combat_needs_rpg_mode,

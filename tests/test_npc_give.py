@@ -171,3 +171,47 @@ async def test_given_items_survive_the_following_gm_turn():
 
         # Assert
         assert [e["id"] for e in manager.state.entity_states["BRAM"]["inventory"]] == ["SWORD"]
+
+
+@pytest.mark.asyncio
+async def test_give_skips_gm_reaction_when_receive_script_opens_a_dialog():
+    async with TestSessionLocal() as db:
+        # Arrange: the NPC answers the handover with a question instead of a GM reaction
+        manager = await _seed_world(db)
+        bram = await _row(db, "BRAM")
+        bram.metadata_json = {
+            "on_receive_item_script": (
+                "tw.dialog.choose('What do you want for it?', ['A deal', 'Nothing'], "
+                "on_choice='on_bram_deal')"
+            )
+        }
+        await db.commit()
+
+        # Act
+        outcome = await give_items_to_npc(manager, "BRAM | SWORD")
+
+        # Assert
+        assert outcome.reaction_prompt is None
+        assert manager.state.entity_states["__pending_dialog__"]["prompt"] == (
+            "What do you want for it?"
+        )
+
+
+@pytest.mark.asyncio
+async def test_npc_line_of_the_receive_script_keeps_its_speech_role():
+    async with TestSessionLocal() as db:
+        # Arrange: Bram answers with tw.npcs.say, which is speech, not a system notice
+        manager = await _seed_world(db)
+        bram = await _row(db, "BRAM")
+        bram.metadata_json = {
+            "on_receive_item_script": "tw.npcs.say('BRAM', 'A fine blade, friend!')"
+        }
+        await db.commit()
+
+        # Act
+        outcome = await give_items_to_npc(manager, "Bram Ironhand | Sword")
+
+        # Assert
+        line = 'Bram Ironhand: "A fine blade, friend!"'
+        assert ("assistant", line) in outcome.events
+        assert ("system", line) not in outcome.events

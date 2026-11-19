@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from backend.core.config import settings
+from backend.engine.audio.audio_state import apply_audio_ops, read_audio_state
 from backend.engine.interaction.script_item_apply import (
     apply_player_inventory,
     insert_cloned_entities,
@@ -15,14 +16,20 @@ from backend.engine.interaction.script_item_apply import (
     sync_exit_rows,
 )
 from backend.engine.interaction.switch_service import SwitchService
+from backend.engine.party.party_ops import apply_party_ops
+from backend.engine.party.party_state import PARTY_KEY
 from backend.engine.rules.game_clock import apply_changeset_clock, clock_view
+from backend.engine.rules.npc_memory import NPC_MEMORY_STATE_KEY, apply_npc_memory_ops
+from backend.engine.rules.respawn import RESPAWN_KEY, apply_respawn_point
 from backend.engine.scripting.context import GameContext, ScriptChangeset
 from backend.engine.scripting.dialog import store_pending_dialog
 from backend.engine.scripting.gm_directions import store_gm_directions
 from backend.engine.scripting.llm_proxy import LlmAsker
+from backend.engine.scripting.narration_skip import store_skip_narration
 from backend.engine.scripting.npc_persona import PERSONA_FIELDS, apply_persona
 from backend.engine.scripting.runner import ScriptRunner
 from backend.engine.scripting.scene_helpers import runner_for_manifest
+from backend.engine.sessions.scene_entry import enter_scene
 from backend.engine.sessions.session_checkpoint_service import SessionCheckpointService
 from backend.models.avatar import Avatar
 from backend.models.chat import ChatMessage
@@ -97,6 +104,11 @@ class TriggerService:
             script_vars=script_vars,
             in_game_time=state.in_game_time,
             clock=clock_view(state),
+            audio=read_audio_state(state.entity_states),
+            audio_library=getattr(adventure, "audio_tracks", None) if adventure else None,
+            party=session_overrides.get(PARTY_KEY),
+            respawn=session_overrides.get(RESPAWN_KEY),
+            npc_memory=session_overrides.get(NPC_MEMORY_STATE_KEY),
             story_flags=story_flags,
             is_debug_enabled=cls.is_debug_mode(state),
             llm_asker=llm_asker,
@@ -128,6 +140,7 @@ class TriggerService:
         script_code: Optional[str] = None,
         narrative_text: Optional[str] = None,
         llm_asker: Optional[LlmAsker] = None,
+        extra_scope: Optional[dict[str, Any]] = None,
     ) -> list[str]:
         """
         Executes a transition trigger (script + narrative text).
@@ -161,8 +174,12 @@ class TriggerService:
         code = str(script_code or "").strip()
         if code:
             context = await cls.build_context(db, state, llm_asker)
+            if extra_scope and "generated_scene" in extra_scope:
+                context.generated_scene = extra_scope["generated_scene"]
             runner = await cls._session_runner(db, state)
-            scope = {"tw": context, "game": context}
+            scope: dict[str, Any] = {"tw": context, "game": context}
+            if extra_scope:
+                scope.update(extra_scope)
             runner.execute_code(code, scope, script_id=f"trigger_{trigger_name}_{target_id}")
 
             if getattr(context.changeset, "ordered_messages", None):
@@ -200,19 +217,20 @@ class TriggerService:
                     )
                     messages.append(sys_msg)
 
-            await insert_cloned_entities(db, state, context.changeset)
-            cls._persist_entity_states(state, context.changeset)
+            from backend.api.routes.adventures.sequence_progress import apply_sequence_changeset
+            from backend.api.routes.adventures.session_adventure import load_session_adventure
+
+            adventure = await load_session_adventure(db, state)
+            await cls._apply_trigger_teleport_and_entities(
+                db, state, context.changeset, adventure, messages
+            )
             cls._persist_exit_states(state, context.changeset)
             apply_player_inventory(await cls._load_avatar(db, state), context.changeset)
             await cls._sync_npc_personas(db, state, context.changeset)
             await sync_entity_rows(db, state, context.changeset)
             await sync_exit_rows(db, state, context.changeset)
 
-            from backend.api.routes.adventures.sequence_progress import apply_sequence_changeset
-            from backend.api.routes.adventures.session_adventure import load_session_adventure
-
             avatar = await cls._load_avatar(db, state)
-            adventure = await load_session_adventure(db, state)
             seq_msgs = await apply_sequence_changeset(adventure, state, avatar, context.changeset)
             messages.extend(seq_msgs)
             messages.extend(
@@ -222,6 +240,27 @@ class TriggerService:
             )
 
         return messages
+
+    @classmethod
+    async def _apply_trigger_teleport_and_entities(
+        cls,
+        db: AsyncSession,
+        state: SessionState,
+        changeset: Any,
+        adventure: Any,
+        messages: list[str],
+    ) -> None:
+        """Apply script teleport, cloned/updated entities, and companion follow-along."""
+        from backend.api.routes.adventures.dynamic_teleport import apply_script_teleport
+
+        left_scene_id = state.current_scene_id
+        await apply_script_teleport(db, state, changeset, adventure=adventure)
+        await insert_cloned_entities(db, state, changeset)
+        cls._persist_entity_states(state, changeset)
+        if state.current_scene_id != left_scene_id:
+            for msg in await enter_scene(db, state, left_scene_id, adventure=adventure):
+                db.add(ChatMessage(session_id=state.session_id, role="system", content=msg))
+                messages.append(msg)
 
     @staticmethod
     async def _load_avatar(db: AsyncSession, state: SessionState) -> Optional[Avatar]:
@@ -244,8 +283,6 @@ class TriggerService:
     @staticmethod
     def _persist_entity_states(state: SessionState, changeset: ScriptChangeset) -> None:
         """Writes variable, movement, entity, flag and dialog updates of a trigger script."""
-        if changeset.teleport_scene_id:
-            state.current_scene_id = changeset.teleport_scene_id
         if not (
             changeset.var_updates
             or changeset.entity_movements
@@ -256,6 +293,9 @@ class TriggerService:
             or changeset.gm_directions
             or changeset.after_narration
             or changeset.clock_ops
+            or changeset.audio_ops
+            or changeset.party_ops
+            or changeset.skip_narration
         ):
             return
         cur_states = dict(state.entity_states or {})
@@ -280,6 +320,11 @@ class TriggerService:
         store_pending_dialog(cur_states, changeset.pending_dialog)
         store_gm_directions(cur_states, changeset.gm_directions, changeset.after_narration)
         apply_changeset_clock(state, cur_states, changeset.clock_ops)
+        apply_audio_ops(cur_states, changeset.audio_ops)
+        apply_party_ops(cur_states, changeset.party_ops)
+        apply_respawn_point(cur_states, changeset.respawn_point)
+        apply_npc_memory_ops(cur_states, changeset.npc_memory_ops)
+        store_skip_narration(cur_states, changeset.skip_narration)
         state.entity_states = cur_states
         flag_modified(state, "entity_states")
 

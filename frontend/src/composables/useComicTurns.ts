@@ -4,7 +4,10 @@ import type { ChatMessage } from '@/types'
 import { buildComicPages, type ComicTurn, type DialogueSegment } from './comicPages'
 import { renderEntityRefsHtml } from '@/utils/entityRefs'
 import { extractCodePlaceholders } from '@/utils/codeMarkup'
+import { extractStoryImages, STORY_IMAGE_ATTRS, STORY_IMAGE_TAGS } from '@/utils/storyImages'
 import { attachCueToSpeech } from './comicTagOnlyLines'
+import { uniqueShortNameMatch } from '@/utils/speakerNames'
+import { canBeSpeakerName } from '@/utils/speakerLabel'
 
 export type { ComicExchange, ComicTurn, DialogueSegment } from './comicPages'
 
@@ -43,7 +46,16 @@ export function resolveNpc(name: string, entities: any[] = [], metadataMap?: Rec
     )
   }
 
-  const meta = resolveNpcMetadata(name, metadataMap) || (foundEntity ? resolveNpcMetadata(foundEntity.id, metadataMap) || resolveNpcMetadata(foundEntity.name, metadataMap) : null)
+  // Shortened names ("Pip Fenwick" for "Professor Pip Fenwick"), only when unambiguous.
+  if (!foundEntity) {
+    const npcs = (entities || []).filter((e) => e.entity_type === 'NPC' && e.name)
+    foundEntity = uniqueShortNameMatch(name, npcs, (e) => String(e.name))
+  }
+
+  const shortMeta = !foundEntity && metadataMap
+    ? uniqueShortNameMatch(name, Object.values(metadataMap).filter((v) => v && typeof v === 'object' && v.name), (v: any) => String(v.name))
+    : null
+  const meta = resolveNpcMetadata(name, metadataMap) || shortMeta || (foundEntity ? resolveNpcMetadata(foundEntity.id, metadataMap) || resolveNpcMetadata(foundEntity.name, metadataMap) : null)
 
   if (foundEntity || meta) {
     return {
@@ -301,8 +313,10 @@ export function parseAssistantContent(
         speechText = speechText.replace(/^["“„»\s]+/, '').trim()
       }
 
-      // Guard against non-speaker labels (e.g. "Hinweis: ...", "Note: ...") when unquoted and not bold
-      if (!hasQuotes && !isBold && NON_SPEAKER_LABELS.has(speakerName.toLowerCase())) {
+      // Guard against non-speaker labels (e.g. "Hinweis: ...", "Note: ...") when unquoted and not bold,
+      // and against times or numbers ("16:30 sharp: ...") that are never a speaker.
+      const isLabel = !hasQuotes && !isBold && NON_SPEAKER_LABELS.has(speakerName.toLowerCase())
+      if (isLabel || !canBeSpeakerName(speakerName, rawSpeech)) {
         const last = dialogues[dialogues.length - 1]
         if (last && last.isNarration) {
           last.text += '\n\n' + line
@@ -392,11 +406,12 @@ export function parseAssistantContent(
 const PAUSE_TAG = /\s*\[(?:short |medium |long )?pause\]\s*/gi
 const QUOTE_CHARS = /["„“”«»]/
 
-/** Escapes the text and renders voice tags, bold text and object ids as markup. */
+/** Escapes the text and renders voice tags, bold text, object ids and `![caption](url)` images. */
 export function renderFormattedHtml(text: string): string {
   if (!text) return ''
   // Pauses only shape the speech output and are not shown.
-  const { tokenized, restore } = extractCodePlaceholders(text)
+  const images = extractStoryImages(text)
+  const { tokenized, restore } = extractCodePlaceholders(images.tokenized)
   const displayText = normalizeTagSyntax(tokenized).replace(PAUSE_TAG, ' ').trim()
   const escaped = displayText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
   const withVoiceTags = escaped.replace(/(\[[^\]\n]+\])/g, (match, tag) => {
@@ -412,22 +427,27 @@ export function renderFormattedHtml(text: string): string {
     .replace(/\n{2,}/g, '<span class="tw-para-break"></span>')
     .replace(/\n/g, '<br>')
 
-  return DOMPurify.sanitize(restore(withObjectIds), {
-    ALLOWED_TAGS: ['span', 'strong', 'em', 'br', 'div', 'pre', 'code'],
-    ALLOWED_ATTR: ['class'],
+  return DOMPurify.sanitize(images.restore(restore(withObjectIds)), {
+    ALLOWED_TAGS: ['span', 'strong', 'em', 'br', 'div', 'pre', 'code', ...STORY_IMAGE_TAGS],
+    ALLOWED_ATTR: ['class', ...STORY_IMAGE_ATTRS],
   })
 }
 
-/** Verbatim text (tw.story.narrate_raw): only escaped, line breaks kept, no markup parsing. */
+/** Verbatim text (tw.story.narrate_raw): only escaped, line breaks and `![caption](url)` images kept. */
 export function renderPlainHtml(text: string): string {
   if (!text) return ''
-  return text
+  const images = extractStoryImages(text)
+  const escaped = images.tokenized
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/\n{2,}/g, '<span class="tw-para-break"></span>')
     .replace(/\n/g, '<br>')
+  return DOMPurify.sanitize(images.restore(escaped), {
+    ALLOWED_TAGS: ['span', 'br', ...STORY_IMAGE_TAGS],
+    ALLOWED_ATTR: ['class', ...STORY_IMAGE_ATTRS],
+  })
 }
 
 /**

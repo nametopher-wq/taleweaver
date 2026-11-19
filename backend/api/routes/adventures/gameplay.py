@@ -13,7 +13,12 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from backend.api.routes.adventures.chat_history import MAX_PAGE_SIZE, visited_sequence_titles
+from backend.api.routes.adventures.audio_snapshot import build_audio_snapshot
+from backend.api.routes.adventures.chat_history import (
+    MAX_PAGE_SIZE,
+    visited_sequence_details,
+    visited_sequence_titles,
+)
 from backend.api.routes.adventures.chat_snapshot import (
     apply_pending_sequence_progress,
     build_awards_for_snapshot,
@@ -64,11 +69,13 @@ from backend.core.prompts import (
     BABLE_FISH_TRANSLATION_SYSTEM_PROMPT,
     BABLE_FISH_TRANSLATION_USER_PROMPT_TEMPLATE,
 )
+from backend.core.turn_key_preflight import ensure_turn_providers_available
 from backend.engine.adventures.adventure_updates import is_legacy_session
 from backend.engine.interaction.trigger_service import TriggerService
 from backend.engine.rules.walkthrough_unlocks import walkthrough_payload, walkthrough_status
 from backend.engine.scripting.dialog import client_dialog, pending_dialog
 from backend.engine.scripting.llm_proxy import LlmAsker
+from backend.engine.sessions.scene_entry import enter_scene
 from backend.engine.world.exit_labels import exit_sentence_name
 from backend.models.avatar import Avatar
 from backend.models.chat import ChatMessage
@@ -181,8 +188,11 @@ async def get_chat_history(
         messages=history.messages,
         has_more_messages=history.has_more,
         sequence_titles=await visited_sequence_titles(db, state.session_id, adventure),
+        sequence_details=await visited_sequence_details(db, state.session_id, adventure),
         sheet=await AdventureLogic.build_sheet_snapshot(avatar, state, db),
-        combat=AdventureLogic.get_combat_snapshot(state),
+        # A locked (finished) story shows no fight, also for sessions saved before the
+        # terminal epilogue cleared it.
+        combat=None if input_locked else AdventureLogic.get_combat_snapshot(state),
         map_data=map_dict,
         nodes=await AdventureLogic.get_all_scene_metadata(
             db, state.template_id, session_id=state.session_id
@@ -215,6 +225,7 @@ async def get_chat_history(
         pending_dialog=None
         if session_status in {"completed", "game_over"}
         else client_dialog(pending_dialog(state.entity_states)),
+        audio=await build_audio_snapshot(db, state, adventure, current_user),
     )
 
 
@@ -226,6 +237,7 @@ async def post_chat_message(
     current_user: User = Depends(get_current_user),
 ):
     """Processes a user message and returns a streaming response."""
+    ensure_turn_providers_available(current_user)
     await ensure_no_pending_dialog(db, game_id, current_user)
     try:
         manager = GameTurnManager(db, game_id, current_user)
@@ -931,6 +943,8 @@ async def traverse_exit(
     await _fire_gameplay_exit_triggers(db, state, world_exit, current_scene_id, llm_asker)
 
     state.current_scene_id = target_scene_id
+    for msg in await enter_scene(db, state, current_scene_id, world_exit=world_exit):
+        db.add(ChatMessage(session_id=state.session_id, role="system", content=msg))
 
     db.add(
         ChatMessage(

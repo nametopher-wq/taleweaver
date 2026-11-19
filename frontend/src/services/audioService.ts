@@ -18,6 +18,13 @@ import {
   prepareStreamElement,
   releaseStreamElement,
 } from '@/services/ttsStream'
+import {
+  BROWSER_TTS_PROVIDER,
+  cancelBrowserSpeech,
+  pauseBrowserSpeech,
+  resumeBrowserSpeech,
+  speakWithBrowser,
+} from '@/services/browserTts'
 
 type SpeakOptions = {
   sceneDescription?: string
@@ -56,8 +63,11 @@ type QueuedSegment = {
   speaker?: string
 }
 
-/** A streaming <audio> element (ElevenLabs) or a whole clip (Gemini, fallback). */
-type PlayableAudio = HTMLAudioElement | Blob
+/** Marker: the browser reads the segment itself (provider "browser", see browserTts.ts). */
+const BROWSER_SPEECH = Symbol('browserSpeech')
+
+/** A streaming <audio> element (ElevenLabs), a whole clip (Gemini, fallback) or browser speech. */
+type PlayableAudio = HTMLAudioElement | Blob | typeof BROWSER_SPEECH
 type PreparedSegment = { segment: QueuedSegment, audio: Promise<PlayableAudio | null> }
 
 // Retrying with simplified text cannot help when the provider is overloaded or rate-limited.
@@ -134,11 +144,17 @@ class AudioService {
   private currentAudio: HTMLAudioElement | null = null
   private currentObjectUrl: string | null = null
   private currentBufferSource: AudioBufferSourceNode | null = null
+  /** Gain of the Web Audio segment that plays now, so it can fade out. */
+  private currentGain: GainNode | null = null
+  /** Set by fadeOutAndStop(): no further segment starts while the current one fades. */
+  private fadingOut = false
   private resolveCurrentPlayback: (() => void) | null = null
   private playbackToken = 0
   private lastTtsRequestAt = 0
   private audioContext: AudioContext | null = null
   private segmentQueue: QueuedSegment[] = []
+  /** Configured TTS provider (from the server settings); "browser" speaks locally. */
+  private provider = ''
   private pipeline: { token: number, promise: Promise<void> } | null = null
 
   public isUnlocked = ref(false)
@@ -309,8 +325,10 @@ class AudioService {
     })
   }
 
-  private async playAudioBufferWithWebAudio(context: AudioContext, blob: Blob): Promise<void> {
+  private async playAudioBufferWithWebAudio(context: AudioContext, blob: Blob, token: number): Promise<void> {
     const audioBuffer = await context.decodeAudioData(await blob.arrayBuffer())
+    // stop() during decoding (e.g. a scene change) must not let the old clip start afterwards.
+    if (token !== this.playbackToken) return
 
     await new Promise<void>((resolve, reject) => {
       const source = context.createBufferSource()
@@ -320,10 +338,14 @@ class AudioService {
       const isWav = (blob.type || '').toLowerCase().includes('wav')
       const requestedRate = this.getSafeSpeechRate()
       source.playbackRate.value = isWav ? Math.min(1.1, Math.max(1.0, requestedRate)) : requestedRate
-      source.connect(context.destination)
+      const gain = context.createGain()
+      source.connect(gain)
+      gain.connect(context.destination)
       this.currentBufferSource = source
+      this.currentGain = gain
       source.onended = () => {
         this.currentBufferSource = null
+        if (this.currentGain === gain) this.currentGain = null
         resolve()
       }
       try {
@@ -335,18 +357,20 @@ class AudioService {
     })
   }
 
-  private async playAudioBlob(blob: Blob): Promise<void> {
+  private async playAudioBlob(blob: Blob, token: number): Promise<void> {
+    if (token !== this.playbackToken) return
     const context = this.audioContext
     if (context?.state === 'running') {
       // Prefer Web Audio: avoids HTMLAudioElement autoplay restrictions and
       // resamples 24 kHz WAV correctly.
       try {
-        await this.playAudioBufferWithWebAudio(context, blob)
+        await this.playAudioBufferWithWebAudio(context, blob, token)
         return
       } catch (err) {
         this.logDebug('WebAudio decode failed; falling back to HTMLAudio', { error: String(err), blobType: blob.type })
       }
     }
+    if (token !== this.playbackToken) return
     await this.playAudioBlobWithHtmlAudio(blob)
   }
 
@@ -376,12 +400,18 @@ class AudioService {
 
   /** A streaming <audio> element (ElevenLabs), else the whole clip as a blob (Gemini, fallback). */
   private async prepareSegmentAudio(segment: QueuedSegment, token: number): Promise<PlayableAudio | null> {
+    if (this.usesBrowserSpeech()) return BROWSER_SPEECH
     if (this.streamingAvailable === false) return this.fetchSegmentAudio(segment, token)
     try {
       await this.waitForTtsRequestSlot()
       if (token !== this.playbackToken) return null
       const element = await prepareStreamElement(segment.request.requestText, segment.request.voiceOverride)
       this.streamingAvailable = true
+      // stop() ran while the stream was prepared: free it instead of letting it keep downloading.
+      if (token !== this.playbackToken) {
+        releaseStreamElement(element)
+        return null
+      }
       this.streamElements.add(element)
       return element
     } catch (err) {
@@ -404,7 +434,7 @@ class AudioService {
       // A failed stream (e.g. rate limit) is retried once as a whole clip.
       this.logDebug('TTS stream playback failed; retrying as whole clip', { error: String(err) })
       const blob = token === this.playbackToken ? await this.fetchSegmentAudio(segment, token) : null
-      if (blob && token === this.playbackToken) await this.playAudioBlob(blob)
+      if (blob) await this.playAudioBlob(blob, token)
     } finally {
       this.streamElements.delete(element)
       releaseStreamElement(element)
@@ -413,14 +443,34 @@ class AudioService {
     }
   }
 
+  /** Browser speech for one segment; skip() and stop() end it through resolveCurrentPlayback. */
+  private async playBrowserSpeech(segment: QueuedSegment): Promise<void> {
+    this.resolveCurrentPlayback = cancelBrowserSpeech
+    try {
+      await speakWithBrowser(segment.request.requestText, {
+        voiceKey: segment.request.voiceOverride || segment.request.speaker || undefined,
+        rate: this.getSafeSpeechRate(),
+        language: segment.context.language,
+      })
+    } catch (err) {
+      this.setPlaybackError(err)
+    } finally {
+      this.resolveCurrentPlayback = null
+    }
+  }
+
   private async playPrepared(playable: PlayableAudio, segment: QueuedSegment, token: number): Promise<void> {
     this.currentText.value = segment.ttsText
     this.currentSpeaker.value = segment.speaker ?? null
+    if (playable === BROWSER_SPEECH) {
+      await this.playBrowserSpeech(segment)
+      return
+    }
     if (playable instanceof HTMLAudioElement) {
       await this.playStream(playable, segment, token)
       return
     }
-    await this.playAudioBlob(playable)
+    await this.playAudioBlob(playable, token)
   }
 
   /** Starts generating queued segments until the lookahead window is full. Streams start
@@ -454,7 +504,7 @@ class AudioService {
         }
         // Paused between lines: hold the next one until the player continues.
         await this.waitWhilePaused()
-        if (token !== this.playbackToken) return
+        if (token !== this.playbackToken || this.fadingOut) return
         if (playable) {
           await this.playPrepared(playable, segment, token).catch((err) => {
             this.logDebug('TTS segment playback failed; continuing', { error: String(err) })
@@ -523,6 +573,10 @@ class AudioService {
   public async download(text: unknown, options: SpeakOptions = {}): Promise<void> {
     const normalizedText = normalizeText(text)
     if (!normalizedText) return
+    if (this.usesBrowserSpeech()) {
+      this.lastError.value = 'Browser speech cannot be saved as a file. Ask the admin for a server TTS provider to download audio.'
+      return
+    }
 
     const [request] = buildSegmentRequests(buildWholeTextSegment(normalizeDialoguePrefixes(normalizedText)), options.npcMetadata)
     if (!request) return
@@ -561,6 +615,7 @@ class AudioService {
     if (this.isPaused.value) return
     this.isPaused.value = true
     this.currentAudio?.pause()
+    if (this.usesBrowserSpeech()) pauseBrowserSpeech()
     if (this.audioContext?.state === 'running') {
       this.audioContext.suspend().catch(() => {})
     }
@@ -572,6 +627,7 @@ class AudioService {
     if (this.audioContext?.state === 'suspended') {
       this.audioContext.resume().catch(() => {})
     }
+    if (this.usesBrowserSpeech()) resumeBrowserSpeech()
     this.currentAudio?.play().catch((err) => this.logDebug('TTS resume failed', { error: String(err) }))
     this.releasePauseWaiters()
   }
@@ -590,6 +646,7 @@ class AudioService {
     if (this.currentBufferSource) {
       try { this.currentBufferSource.stop() } catch { /* already stopped */ }
     }
+    if (this.usesBrowserSpeech()) cancelBrowserSpeech()
     if (this.currentAudio) {
       this.currentAudio.pause()
       const settle = this.resolveCurrentPlayback
@@ -614,7 +671,61 @@ class AudioService {
     this.streamingAvailable = null
   }
 
+  /** The configured TTS provider; "browser" makes the browser read the text itself. */
+  public setProvider(provider: string): void {
+    if (this.provider === provider) return
+    this.stop()
+    this.provider = provider
+  }
+
+  public usesBrowserSpeech(): boolean {
+    return this.provider === BROWSER_TTS_PROVIDER
+  }
+
+  /**
+   * Fades the speech that plays now out, then stops it and drops the queue (script
+   * `tw.audio.stop_speech(fade)`, e.g. before an audio track starts). Without speech: no-op.
+   */
+  fadeOutAndStop(seconds = 0.5): Promise<void> {
+    const ms = Math.round(Math.min(5, Math.max(0, seconds)) * 1000)
+    if (!this.isPlaying.value && !this.isGenerating.value) return Promise.resolve()
+    // Nothing new starts while the current line fades.
+    this.segmentQueue = []
+    this.fadingOut = true
+    const token = this.playbackToken
+    if (ms === 0) {
+      this.stop()
+      return Promise.resolve()
+    }
+    const element = this.currentAudio
+    if (element) {
+      const start = element.volume
+      const began = performance.now()
+      const step = (): void => {
+        if (this.currentAudio !== element) return
+        const progress = Math.min(1, (performance.now() - began) / ms)
+        element.volume = Math.max(0, start * (1 - progress))
+        if (progress < 1) requestAnimationFrame(step)
+      }
+      requestAnimationFrame(step)
+    }
+    const gain = this.currentGain
+    const context = this.audioContext
+    if (gain && context) {
+      gain.gain.setValueAtTime(gain.gain.value, context.currentTime)
+      gain.gain.linearRampToValueAtTime(0, context.currentTime + ms / 1000)
+    }
+    return new Promise((resolve) => {
+      window.setTimeout(() => {
+        if (token === this.playbackToken) this.stop()
+        else this.fadingOut = false
+        resolve()
+      }, ms)
+    })
+  }
+
   stop() {
+    this.fadingOut = false
     this.playbackToken += 1
     this.segmentQueue = []
     // A paused queue is dropped too; release it and leave the audio context usable.
@@ -626,10 +737,12 @@ class AudioService {
     // Prepared streams keep downloading (and costing credits) unless released.
     for (const element of this.streamElements) releaseStreamElement(element)
     this.streamElements.clear()
+    if (this.usesBrowserSpeech()) cancelBrowserSpeech()
     if (this.currentBufferSource) {
       try { this.currentBufferSource.stop() } catch { /* already stopped */ }
       this.currentBufferSource = null
     }
+    this.currentGain = null
     if (this.currentAudio) {
       this.currentAudio.pause()
       this.currentAudio = null

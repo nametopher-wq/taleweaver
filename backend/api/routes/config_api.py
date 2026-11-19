@@ -8,7 +8,6 @@ from typing import Any, Optional
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.routes.settings_normalization import (
@@ -26,6 +25,14 @@ from backend.api.routes.settings_normalization import (
 from backend.api.routes.settings_normalization import (
     normalize_tts_settings as _normalize_tts_settings,
 )
+from backend.api.routes.tts_api import test_tts_connection_v2
+from backend.core.api_keys import (
+    SPEECH_KEY_PROVIDERS,
+    PersonalKeyRequiredError,
+    has_api_key,
+    personal_key_message,
+    resolve_api_key,
+)
 from backend.core.auth import get_current_admin, get_current_user
 from backend.core.catalog_defaults import DEFAULT_IMAGE_STYLES, DEFAULT_TONES
 from backend.core.comfyui import ComfySettings, ComfyTestOptions, default_edge
@@ -33,6 +40,11 @@ from backend.core.config import settings
 from backend.core.custom_openai_diagnostics import connection_test_diagnostic
 from backend.core.database import get_db
 from backend.core.error_diagnostics import diagnose_provider_error
+from backend.core.global_settings import (
+    get_server_settings_for_update,
+    read_server_settings,
+    shared_game_settings,
+)
 from backend.core.llm_router import GameMasterLLM
 from backend.core.models_config import (
     IMAGE_PROVIDERS,
@@ -43,8 +55,9 @@ from backend.core.models_config import (
     TTS_PROVIDERS,
 )
 from backend.core.security import encryption_util
-from backend.core.tts_preferences import with_user_scoped_settings
-from backend.crud.crud_game_settings import broadcast_game_settings
+from backend.core.turn_key_preflight import missing_turn_keys
+from backend.engine.audio.browser_tts import is_browser_provider
+from backend.engine.audio.openai_compatible_tts import OPENAI_COMPATIBLE_PROVIDER
 from backend.engine.audio.tts_engine import TTSEngine, TTSModelSwitchSuggestionError
 from backend.engine.media.asset_naming import asset_filename
 from backend.engine.media.media_engine import MediaEngine
@@ -73,31 +86,6 @@ _CATALOG_EXT_BY_CONTENT_TYPE = {
     "image/jpeg": "jpg",
     "image/webp": "webp",
 }
-
-
-async def _resolve_global_settings_owner(db: AsyncSession, fallback_user: User) -> User:
-    """Return the user that acts as global settings source (prefer admin)."""
-    admin_res = await db.execute(select(User).where(User.role == "admin").limit(1))
-    admin_user = admin_res.scalars().first()
-    return admin_user or fallback_user
-
-
-async def _broadcast_global_settings(db: AsyncSession, source_user: User) -> None:
-    """Copy global settings from source user to all users efficiently."""
-    # Using a bulk update is much better for SQLite to avoid lock contention
-    # and memory overhead of fetching all user objects.
-    await db.execute(
-        update(User).values(
-            encrypted_api_keys=dict(source_user.encrypted_api_keys or {}),
-            llm_settings=dict(source_user.llm_settings or {}),
-            t2i_settings=dict(source_user.t2i_settings or {}),
-            image_styles_catalog=list(source_user.image_styles_catalog or []),
-            tone_catalog=list(source_user.tone_catalog or []),
-            tts_settings=dict(source_user.tts_settings or {}),
-        )
-    )
-    # game_settings also holds player-owned keys (Auto-Speak preferences) that must survive.
-    await broadcast_game_settings(db, source_user.game_settings)
 
 
 def _slugify(value: str) -> str:
@@ -418,18 +406,12 @@ async def _build_available_constants(
 
 
 def _normalize_game_settings(game_settings: Optional[dict]) -> dict:
-    fallback = {
-        "clock_24h": False,
-        "date_format": "DD.MM.YY",
-        "whisper_model": "tiny",
+    # The clock format is a player preference now (User.game_settings["clock_format"]).
+    normalized = {
+        key: value
+        for key, value in (game_settings or {}).items()
+        if key not in ("clock_24h", "date_format")
     }
-    if not game_settings:
-        return fallback
-    normalized = dict(game_settings)
-    if "clock_24h" not in normalized:
-        normalized["clock_24h"] = False
-    if "date_format" not in normalized:
-        normalized["date_format"] = "DD.MM.YY"
     if "whisper_model" not in normalized:
         normalized["whisper_model"] = "tiny"
     return normalized
@@ -448,7 +430,7 @@ def _is_llm_configured(user: User, db_keys: dict) -> bool:
             return bool(per_pass or llm.get("custom_openai_url"))
         if provider == "ollama":
             return True
-        return bool(settings.get_env_api_key(provider)) or (db_keys and provider in db_keys)
+        return has_api_key(db_keys, provider)
 
     return all(
         [
@@ -468,29 +450,20 @@ def _is_t2i_configured(user: User, db_keys: dict) -> bool:
     def has_key(provider):
         if provider in ("ollama", "stable_diffusion", "comfyui"):
             return True
-        has_api_key = bool(settings.get_env_api_key(provider)) or (db_keys and provider in db_keys)
         if provider == "custom_openai":
             custom_url = MediaEngine.resolve_custom_openai_url(user.llm_settings or {})
-            return has_api_key and bool(custom_url)
-        return has_api_key
+            return has_api_key(db_keys, provider) and bool(custom_url)
+        return has_api_key(db_keys, provider)
 
     return has_key(simple_provider) and bool(simple_model)
 
 
 def _resolve_provider_api_key(provider: str, encrypted_keys: Optional[dict]) -> Optional[str]:
-    """Resolve provider API key from environment first, then encrypted DB keys."""
-    provider_key = (provider or "").lower()
-    env_key = settings.get_env_api_key(provider_key)
-    if env_key:
-        return env_key
-
-    if encrypted_keys and provider_key in encrypted_keys:
-        try:
-            return encryption_util.decrypt_key(encrypted_keys[provider_key])
-        except (ValueError, TypeError, KeyError):
-            logger.error("Failed to decrypt API key for provider: %s", provider_key)
-            return None
-    return None
+    """The caller's key for ``provider`` per the key policy; ``None`` when unavailable."""
+    try:
+        return resolve_api_key(encrypted_keys, provider)
+    except PersonalKeyRequiredError:
+        return None
 
 
 class ApiKeyPayload(BaseModel):
@@ -586,8 +559,6 @@ class T2ISettingsPayload(ComfySettings):
 
 
 class GameSettingsPayload(BaseModel):
-    clock_24h: bool = False
-    date_format: str = "DD.MM.YY"
     whisper_model: str = "tiny"
 
 
@@ -597,6 +568,12 @@ class TTSSettingsPayload(BaseModel):
     selected_model: str = "gemini-3.8-flash-tts"
     selected_voice: str = "Puck"
     elevenlabs_voice_id: str = ""
+    custom_openai_url: str = Field(default="", max_length=500)
+    custom_openai_voice: str = Field(default="", max_length=200)
+    custom_openai_format: str = Field(default="mp3", max_length=8)
+    custom_openai_instructions: str = Field(default="", max_length=2000)
+    browser_voice: str = Field(default="", max_length=200)
+    browser_character_voices: list[str] = Field(default_factory=list, max_length=40)
     use_vocal_tags: bool = True
     use_streaming: bool = False
     auto_speak: bool = True
@@ -632,22 +609,8 @@ async def get_settings(
     current_user: User = Depends(get_current_user),
 ):
     """Returns the current settings (sanitized keys)."""
-    user = await _resolve_global_settings_owner(db, current_user)
-
-    # Common defaults if no user/settings
-    default_llm = _normalize_llm_settings(None)
-    default_t2i = _normalize_t2i_settings(None)
-    default_available_constants = (
-        await _build_available_constants(default_llm, default_t2i)
-        if include_available_constants
-        else {
-            "llm_providers": LLM_PROVIDERS,
-            "image_providers": IMAGE_PROVIDERS,
-            "tts_providers": TTS_PROVIDERS,
-            "predefined_llm_models": dict(PREDEFINED_LLM_MODELS),
-            "predefined_image_models": dict(PREDEFINED_IMAGE_MODELS),
-        }
-    )
+    user = current_user
+    server = await read_server_settings(db)
 
     def get_keys_status(db_keys):
         status = {}
@@ -655,6 +618,7 @@ async def get_settings(
             {p["id"] for p in LLM_PROVIDERS}
             | {p["id"] for p in IMAGE_PROVIDERS}
             | {p["id"] for p in TTS_PROVIDERS}
+            | {p["id"] for p in SPEECH_KEY_PROVIDERS}
         )
         for p in all_providers:
             # Check environment first
@@ -663,22 +627,6 @@ async def get_settings(
             elif db_keys and p in db_keys:
                 status[p] = {"masked": "********", "is_env": False}
         return status
-
-    if not user:
-        return {
-            "app_version": settings.APP_VERSION,
-            "keys": get_keys_status({}),
-            "llm_settings": default_llm,
-            "t2i_settings": default_t2i,
-            "is_llm_configured": False,
-            "is_t2i_configured": False,
-            "image_styles_catalog": _default_image_styles_catalog(),
-            "tone_catalog": _default_tone_catalog(),
-            "game_settings": _normalize_game_settings(None),
-            "available_constants": {
-                **default_available_constants,
-            },
-        }
 
     normalized_llm_settings = _normalize_llm_settings(user.llm_settings)
     available_constants = (
@@ -695,11 +643,13 @@ async def get_settings(
 
     return {
         "app_version": settings.APP_VERSION,
-        "keys": get_keys_status(user.encrypted_api_keys),
+        "keys": get_keys_status(server.encrypted_api_keys),
         "llm_settings": normalized_llm_settings,
         "t2i_settings": _normalize_t2i_settings(user.t2i_settings),
         "is_llm_configured": _is_llm_configured(user, user.encrypted_api_keys),
         "is_t2i_configured": _is_t2i_configured(user, user.encrypted_api_keys),
+        # Chat passes this user cannot run (own key required / provider disabled).
+        "missing_personal_keys": missing_turn_keys(user),
         "image_styles_catalog": _normalize_catalog(
             user.image_styles_catalog,
             fallback=_default_image_styles_catalog(),
@@ -708,7 +658,7 @@ async def get_settings(
             user.tone_catalog,
             fallback=_default_tone_catalog(),
         ),
-        "game_settings": _normalize_game_settings(user.game_settings),
+        "game_settings": _normalize_game_settings(server.game_settings),
         "tts_settings": _normalize_tts_settings(user.tts_settings),
         "available_constants": available_constants,
     }
@@ -750,13 +700,7 @@ async def get_minimax_models(
 ):
     """Return available MiniMax model names for the configured endpoint."""
     if not api_key:
-        user = await _resolve_global_settings_owner(db, current_user)
-        if user and user.encrypted_api_keys and "minimax" in user.encrypted_api_keys:
-            from backend.core.security import encryption_util
-
-            api_key = encryption_util.decrypt_key(user.encrypted_api_keys["minimax"])
-        elif settings.MINIMAX_API_KEY:
-            api_key = settings.MINIMAX_API_KEY
+        api_key = _resolve_provider_api_key("minimax", current_user.encrypted_api_keys)
 
     try:
         validated_base = validate_provider_url(api_base or settings.MINIMAX_API_BASE)
@@ -769,16 +713,9 @@ async def get_minimax_models(
 async def _resolve_provider_api_key_for_models(
     db: AsyncSession, current_user: User, provider: str
 ) -> Optional[str]:
-    """Return the best available API key for a provider (user DB first, then env)."""
-    user = await _resolve_global_settings_owner(db, current_user)
-    if user and user.encrypted_api_keys and provider in user.encrypted_api_keys:
-        from backend.core.security import encryption_util
-
-        try:
-            return encryption_util.decrypt_key(user.encrypted_api_keys[provider])
-        except (ValueError, TypeError, KeyError):
-            logger.error("Failed to decrypt API key for provider '%s'", provider)
-    return settings.get_env_api_key(provider)
+    """The caller's key for ``provider`` (personal, env or server key, per key policy)."""
+    _ = db
+    return _resolve_provider_api_key(provider, current_user.encrypted_api_keys)
 
 
 @router.get("/llm-models")
@@ -795,7 +732,7 @@ async def get_llm_models(
 
         if current_user.role != "admin":
             raise HTTPException(status_code=403, detail="Administrator access required.")
-        user = await _resolve_global_settings_owner(db, current_user)
+        user = current_user
         base = api_base or (user.llm_settings or {}).get("custom_openai_url", "")
         key = await _resolve_provider_api_key_for_models(db, current_user, "custom_openai")
         return {"models": await discover_models(base, key)}
@@ -827,7 +764,7 @@ async def update_api_key(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
-    """Saves an encrypted API key for the authenticated user."""
+    """Saves an encrypted API key for the authenticated server."""
     provider_lower = payload.provider.lower()
 
     # Block updates for environment-configured keys
@@ -837,7 +774,7 @@ async def update_api_key(
             detail=f"The API key for {payload.provider} is managed via environment variables and cannot be modified here.",
         )
 
-    user = await _resolve_global_settings_owner(db, current_user)
+    server = await get_server_settings_for_update(db)
 
     normalized_api_key = (payload.api_key or "").strip()
     if (
@@ -852,12 +789,11 @@ async def update_api_key(
 
     encrypted_key = encryption_util.encrypt_key(normalized_api_key)
 
-    current_keys = user.encrypted_api_keys or {}
+    current_keys = server.encrypted_api_keys or {}
     new_keys = dict(current_keys)
     new_keys[provider_lower] = encrypted_key
-    user.encrypted_api_keys = new_keys
+    server.encrypted_api_keys = new_keys
 
-    await _broadcast_global_settings(db, user)
     await db.commit()
     clear_model_discovery_cache()
     return {"status": "success", "message": f"{payload.provider} key saved securely."}
@@ -869,7 +805,7 @@ async def delete_api_key(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
-    """Deletes an encrypted API key for the authenticated user."""
+    """Deletes an encrypted API key for the authenticated server."""
     provider_lower = provider.lower()
     logger.info("[Admin] Deleting API key for provider: %s (lower: %s)", provider, provider_lower)
 
@@ -881,10 +817,9 @@ async def delete_api_key(
             detail=f"The API key for {provider} is managed via environment variables and cannot be deleted here.",
         )
 
-    user = await _resolve_global_settings_owner(db, current_user)
-    logger.info("[Admin] Settings owner resolved for delete operation")
+    server = await get_server_settings_for_update(db)
 
-    current_keys = user.encrypted_api_keys or {}
+    current_keys = server.encrypted_api_keys or {}
     logger.info("[Admin] Current API key count in DB: %d", len(current_keys))
 
     if provider_lower not in current_keys:
@@ -893,9 +828,8 @@ async def delete_api_key(
 
     new_keys = dict(current_keys)
     del new_keys[provider_lower]
-    user.encrypted_api_keys = new_keys
+    server.encrypted_api_keys = new_keys
 
-    await _broadcast_global_settings(db, user)
     await db.commit()
     clear_model_discovery_cache()
     logger.info("[Admin] Successfully removed key for %s", provider_lower)
@@ -909,7 +843,7 @@ async def update_llm_settings(
     current_user: User = Depends(get_current_admin),
 ):
     """Updates the LLM model preferences."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    server = await get_server_settings_for_update(db)
 
     from backend.core.custom_openai import validate_custom_url
 
@@ -920,8 +854,7 @@ async def update_llm_settings(
         val = getattr(payload, field, None)
         if val:
             setattr(payload, field, validate_custom_url(val))
-    user.llm_settings = _normalize_llm_settings(payload.model_dump())
-    await _broadcast_global_settings(db, user)
+    server.llm_settings = _normalize_llm_settings(payload.model_dump())
     await db.commit()
     return {"status": "success", "message": "LLM settings updated."}
 
@@ -933,10 +866,9 @@ async def update_t2i_settings(
     current_user: User = Depends(get_current_admin),
 ):
     """Updates the Text-to-Image model preferences."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    server = await get_server_settings_for_update(db)
 
-    user.t2i_settings = _normalize_t2i_settings(payload.model_dump())
-    await _broadcast_global_settings(db, user)
+    server.t2i_settings = _normalize_t2i_settings(payload.model_dump())
     await db.commit()
     return {"status": "success", "message": "Image generation settings updated."}
 
@@ -948,12 +880,11 @@ async def update_tts_settings(
     current_user: User = Depends(get_current_admin),
 ):
     """Updates the TTS settings."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    server = await get_server_settings_for_update(db)
 
     # Use full model dump to capture all fields from the UI, then normalize.
-    user.tts_settings = _normalize_tts_settings(payload.model_dump())
+    server.tts_settings = _normalize_tts_settings(payload.model_dump())
 
-    await _broadcast_global_settings(db, user)
     await db.commit()
     return {"status": "success", "message": "TTS settings updated."}
 
@@ -1025,7 +956,7 @@ async def test_llm_connection(
     current_user: User = Depends(get_current_user),
 ):
     """Tests the connection to an LLM provider with a simple prompt and measures latency."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    user = current_user
     old_settings = user.llm_settings or {}
     user.llm_settings = _build_test_llm_settings(old_settings, payload)
 
@@ -1044,6 +975,15 @@ async def test_llm_connection(
         response = await _execute_test_probe(gm, payload)
         end_time = time.perf_counter()
         latency = round(end_time - start_time, 2)
+        if not (response or "").strip():
+            return {
+                "status": "error",
+                "message": (
+                    f"Model '{payload.model}' returned no visible text (it likely spent its output "
+                    "budget on internal thinking). Enable Reasoning / Thinking Mode or increase "
+                    "Max Thinking Tokens."
+                ),
+            }
         return {"status": "success", "message": response, "response_time": latency}
     except Exception as exc:
         diag = (
@@ -1083,17 +1023,16 @@ def _resolve_vision_api_key(
     """Returns (api_key, error_response); local providers need no key."""
     if provider_key in _LOCAL_IMAGE_PROVIDERS:
         return None, None
-    api_key = settings.get_env_api_key(provider_key)
-    if api_key:
-        return api_key, None
-    encrypted_keys = user.encrypted_api_keys
-    if not encrypted_keys or provider_key not in encrypted_keys:
-        return None, {"status": "error", "message": f"No API key configured for {provider_name}."}
     try:
-        return encryption_util.decrypt_key(encrypted_keys[provider_key]), None
-    except Exception as dec_exc:
-        diag = diagnose_provider_error(dec_exc, provider=provider_name, context="vision")
-        return None, {"status": "error", "message": diag}
+        api_key = resolve_api_key(user.encrypted_api_keys, provider_key)
+    except PersonalKeyRequiredError as exc:
+        return None, {
+            "status": "error",
+            "message": personal_key_message(exc.provider, exc.reason),
+        }
+    if not api_key:
+        return None, {"status": "error", "message": f"No API key configured for {provider_name}."}
+    return api_key, None
 
 
 def _build_vision_provider_options(payload: "TestVisionPayload", provider_key: str) -> dict:
@@ -1136,7 +1075,7 @@ async def test_vision_connection(
     current_user: User = Depends(get_current_user),
 ):
     """Tests the connection to an image provider by generating a wizard portrait."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    user = current_user
     provider_key = payload.provider.lower()
     if provider_key == "custom_openai" and not payload.custom_openai_url:
         payload.custom_openai_url = (user.llm_settings or {}).get("custom_openai_url") or None
@@ -1176,21 +1115,27 @@ async def test_tts_connection(
     current_user: User = Depends(get_current_user),
 ):
     """Generates a short test sentence to verify TTS configuration."""
-    user = await _resolve_global_settings_owner(db, current_user)
-    tts_settings = user.tts_settings or {}
+    provider = str((current_user.tts_settings or {}).get("provider", "google")).lower()
+    if provider == OPENAI_COMPATIBLE_PROVIDER:
+        return await test_tts_connection_v2(db=db, current_user=current_user)
+    if is_browser_provider(provider):
+        # The client plays the sample with its own speech synthesis.
+        return {"status": "success", "browser": True, "message": "Browser voice"}
+    return await _test_keyed_tts_provider(current_user, provider)
 
-    provider = tts_settings.get("provider", "google").lower()
+
+async def _test_keyed_tts_provider(user: User, provider: str) -> dict:
+    """Test sentence for the providers that need an API key (Gemini, ElevenLabs)."""
+    tts_settings = user.tts_settings or {}
     api_key = None
     if provider != "qwen":
-        api_key = settings.get_env_api_key(provider)
-        if not api_key and user.encrypted_api_keys:
-            enc_key = user.encrypted_api_keys.get(provider)
-            if enc_key:
-                try:
-                    api_key = encryption_util.decrypt_key(enc_key)
-                except Exception as dec_exc:
-                    diag = diagnose_provider_error(dec_exc, provider=provider, context="tts")
-                    return {"status": "error", "message": diag}
+        try:
+            api_key = resolve_api_key(user.encrypted_api_keys, provider)
+        except PersonalKeyRequiredError as exc:
+            return {
+                "status": "error",
+                "message": personal_key_message(exc.provider, exc.reason),
+            }
 
         if not api_key:
             return {
@@ -1234,13 +1179,12 @@ async def update_image_styles_catalog(
     current_user: User = Depends(get_current_admin),
 ):
     """Updates the admin-managed image styles catalog for adventure generation."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    server = await get_server_settings_for_update(db)
 
     raw_items = [item.model_dump() for item in payload.items]
-    user.image_styles_catalog = _normalize_catalog(
+    server.image_styles_catalog = _normalize_catalog(
         raw_items, fallback=_default_image_styles_catalog()
     )
-    await _broadcast_global_settings(db, user)
     await db.commit()
     return {"status": "success", "message": "Image styles catalog updated."}
 
@@ -1252,11 +1196,10 @@ async def update_tone_catalog(
     current_user: User = Depends(get_current_admin),
 ):
     """Updates the admin-managed tone catalog for world generation."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    server = await get_server_settings_for_update(db)
 
     raw_items = [item.model_dump() for item in payload.items]
-    user.tone_catalog = _normalize_catalog(raw_items, fallback=_default_tone_catalog())
-    await _broadcast_global_settings(db, user)
+    server.tone_catalog = _normalize_catalog(raw_items, fallback=_default_tone_catalog())
     await db.commit()
     return {"status": "success", "message": "Tone catalog updated."}
 
@@ -1268,7 +1211,7 @@ async def generate_catalog_image(
     current_user: User = Depends(get_current_user),
 ):
     """Generates an image for a catalog tile (style or tone)."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    user = current_user
 
     t2i = user.t2i_settings or {}
     provider = (t2i.get("simple_model_provider") or t2i.get("provider", "openai")).lower()
@@ -1376,10 +1319,9 @@ async def update_game_settings(
     current_user: User = Depends(get_current_admin),
 ):
     """Updates the general game preferences."""
-    user = await _resolve_global_settings_owner(db, current_user)
+    server = await get_server_settings_for_update(db)
 
-    user.game_settings = with_user_scoped_settings(payload.model_dump(), user.game_settings)
-    await _broadcast_global_settings(db, user)
+    server.game_settings = shared_game_settings(payload.model_dump())
     await db.commit()
     return {"status": "success", "message": "Game settings updated."}
 

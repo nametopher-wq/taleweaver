@@ -19,8 +19,8 @@ import requests
 from PIL import Image
 
 from backend.core import prompts
+from backend.core.api_keys import resolve_api_key
 from backend.core.config import settings
-from backend.core.security import encryption_util
 from backend.engine.media.asset_naming import (
     DEFAULT_IMAGE_FORMAT,
     asset_filename,
@@ -256,11 +256,13 @@ def _write_binary_file(filepath: str, payload: bytes) -> None:
     safe_filepath = ensure_within_base_dir(
         os.path.join(safe_parent_dir, safe_filename), safe_parent_dir
     )
-    # Re-verify containment at the sink so the taint analysis trusts the path.
-    data_root = os.path.realpath(settings.DATA_DIR)
-    if os.path.commonpath([os.path.realpath(safe_filepath), data_root]) != data_root:
+    # Re-verify containment at the sink so the taint analysis trusts the path; the parent
+    # folder is derived from the checked file path, never created from an unchecked one.
+    data_root = os.path.abspath(os.path.realpath(settings.DATA_DIR))
+    safe_filepath = os.path.abspath(os.path.realpath(safe_filepath))
+    if not safe_filepath.startswith(data_root + os.sep):
         raise ValueError("Invalid filepath: escapes DATA_DIR.")
-    os.makedirs(safe_parent_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(safe_filepath), exist_ok=True)
     with open(safe_filepath, "wb") as file_handle:
         file_handle.write(payload)
 
@@ -645,23 +647,11 @@ class MediaEngine:
 
     @staticmethod
     def _resolve_api_key(provider: str, api_keys_dict: dict) -> Optional[str]:
-        """Resolves API key by checking environment variables first, then the provided dictionary."""
-        provider_key = (provider or "").lower()
+        """Key for ``provider`` per the key policy (personal, env or stored server key).
 
-        # 1. Check environment variables first
-        env_key = settings.get_env_api_key(provider_key)
-        if env_key:
-            return env_key
-
-        # 2. Fallback to database-stored (and encrypted) keys
-        if api_keys_dict and provider_key in api_keys_dict:
-            try:
-                return encryption_util.decrypt_key(api_keys_dict[provider_key])
-            except (ValueError, TypeError, KeyError):
-                logger.error("Failed to decrypt API key for provider '%s'", provider_key)
-                return None
-
-        return None
+        Raises ``PersonalKeyRequiredError`` when the provider is unavailable for this user.
+        """
+        return resolve_api_key(api_keys_dict, provider)
 
     @staticmethod
     async def generate_image(

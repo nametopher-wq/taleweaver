@@ -9,6 +9,7 @@ import backend.models.avatar  # noqa: F401
 import backend.models.character  # noqa: F401
 import backend.models.chat  # noqa: F401
 import backend.models.game_session  # noqa: F401
+import backend.models.server_settings  # noqa: F401
 import backend.models.session_state  # noqa: F401
 
 # Import all models so metadata is fully registered for autogenerate.
@@ -22,7 +23,7 @@ from backend.models.base import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 
 def _sync_database_url(url: str) -> str:

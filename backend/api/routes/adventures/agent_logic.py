@@ -3,17 +3,34 @@ import os
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from backend.api.routes.adventures.agent_access import uses_monkey_mode, uses_walkthrough
 from backend.api.routes.adventures.agent_actions import (
-    container_lock_hint,
     format_exits_for_agent,
     load_scene_exits,
 )
+from backend.api.routes.adventures.agent_dialogue import (
+    DEFAULT_DIALOGUE_LEVEL,
+    dialogue_prompt,
+    normalize_dialogue_level,
+)
+from backend.api.routes.adventures.agent_instruction import (
+    instruction_prompt,
+    normalize_instruction,
+)
+from backend.api.routes.adventures.agent_known_map import format_known_map, load_known_map
+from backend.api.routes.adventures.agent_memory import format_memories
+from backend.api.routes.adventures.agent_objectives import format_objectives
+from backend.api.routes.adventures.agent_party_view import format_abilities_and_party
 from backend.api.routes.adventures.agent_persona import format_protagonist_profile
-from backend.api.routes.adventures.logic import AdventureLogic
+from backend.api.routes.adventures.agent_travel import TRAVEL_KEY
+from backend.api.routes.adventures.agent_world_view import (
+    format_room_objects,
+    load_room_entities,
+    opened_container_ids,
+)
 from backend.api.routes.adventures.turn_context_helpers import (
     _find_active_sequence,
     resolve_sequence_guidance,
@@ -28,7 +45,6 @@ from backend.models.adventure_template import AdventureTemplate
 from backend.models.avatar import Avatar
 from backend.models.session_state import SessionState
 from backend.models.user import User
-from backend.models.world_entity import WorldEntity
 from backend.utils.path_security import (
     ensure_within_data_dir,
     safe_data_path,
@@ -36,6 +52,9 @@ from backend.utils.path_security import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound of the configurable pause between two auto-mode turns.
+MAX_STEP_DELAY_SECONDS = 300
 
 
 def _resolve_session_issue_log_path(session_id: str) -> str:
@@ -53,7 +72,10 @@ def _resolve_session_issue_log_path(session_id: str) -> str:
 
 class AgentDecision(BaseModel):
     thoughts: str = Field(
-        description="Internal reasoning and goals based on the character persona, situation, and walkthrough."
+        description=(
+            "The character's inner voice: what they notice, want and plan next, in first person "
+            "and in character (shown to the player)."
+        )
     )
     action: str = Field(
         description="The next action or slash command to execute (e.g. '/inspect shelf', 'go north', '/say Hello')."
@@ -63,6 +85,24 @@ class AgentDecision(BaseModel):
     )
     issue_description: str = Field(
         description="Description of the bug, error, or blocker if is_stuck_or_bug is true. Otherwise empty."
+    )
+    instruction_done: bool = Field(
+        default=False,
+        description=(
+            "True when this action completes the player's instruction, or when it clearly "
+            "cannot be done. False without an instruction."
+        ),
+    )
+    remember: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional short notes to save in persistent memory for later turns (codes, clues, "
+            "facts, or 'Already read <item>'). Keep empty if nothing new needs remembering."
+        ),
+    )
+    forget: list[str] = Field(
+        default_factory=list,
+        description="Optional note snippets from YOUR MEMORY / NOTES that are now obsolete and can be removed.",
     )
 
 
@@ -132,50 +172,13 @@ def build_player_perception_context(
     return "\n\n".join(parts)
 
 
-def _collect_visible_scene_item_names(
-    scene_entities: list[WorldEntity],
-    states: dict[str, Any],
-    current_scene_id: str | None,
-) -> list[str]:
-    container_payloads = [
-        {
-            "item_type": states.get(e.id, {}).get("item_type", e.item_type)
-            if isinstance(states, dict)
-            else e.item_type,
-            "inventory": states.get(e.id, {}).get("inventory", e.inventory)
-            if isinstance(states, dict)
-            else e.inventory,
-        }
-        for e in scene_entities
-    ]
-    contained_ids = AdventureLogic.collect_container_item_ids(container_payloads)
-
-    visible_names: list[str] = []
-    for entity in scene_entities:
-        e_state = states.get(entity.id, {}) if isinstance(states, dict) else {}
-        if e_state.get("current_scene_id", entity.current_scene_id) != current_scene_id:
-            continue
-        if bool(e_state.get("is_hidden", entity.is_hidden)):
-            continue
-        if bool(e_state.get("is_in_inventory", entity.is_in_inventory)):
-            continue
-        if str(entity.id or "") in contained_ids:
-            continue
-        if not entity.name:
-            continue
-        is_container = str(entity.item_type or "").upper() == "CONTAINER"
-        hint = container_lock_hint(entity, states) if is_container else ""
-        visible_names.append(f"{entity.name}{hint}")
-    return visible_names
-
-
 def _build_agent_objective_and_walkthrough(
     adventure: Any,
     state: Any,
     agent_state: dict[str, Any],
 ) -> tuple[str, str]:
-    monkey_mode = bool(agent_state.get("monkey_mode", False))
-    allow_walkthrough = bool(agent_state.get("allow_walkthrough", True))
+    monkey_mode = uses_monkey_mode(state, agent_state)
+    allow_walkthrough = uses_walkthrough(adventure, state, agent_state)
 
     if monkey_mode:
         objective = (
@@ -276,6 +279,9 @@ class AgentService:
             ("step_by_step", False),
             ("personality", "casual"),
             ("custom_personality", ""),
+            ("step_delay", 0),
+            ("wait_for_tts", True),
+            ("dialogue_level", DEFAULT_DIALOGUE_LEVEL),
         ):
             if key not in agent_state:
                 agent_state[key] = default
@@ -296,6 +302,9 @@ class AgentService:
         agent_state["active"] = active
         if active:
             agent_state["failure_count"] = 0
+        else:
+            # A trip started by the agent does not resume when the player starts it again.
+            agent_state.pop(TRAVEL_KEY, None)
         state.entity_states["__agent__"] = agent_state
         flag_modified(state, "entity_states")
 
@@ -335,6 +344,45 @@ class AgentService:
         """Enable/disable step-by-step confirmation mode for the play-agent."""
         agent_state = AgentService.get_agent_state(state)
         agent_state["step_by_step"] = enabled
+        state.entity_states["__agent__"] = agent_state
+        flag_modified(state, "entity_states")
+
+    @staticmethod
+    def set_step_delay(state: SessionState, seconds: int) -> None:
+        """Pause in seconds between two agent turns in auto mode."""
+        agent_state = AgentService.get_agent_state(state)
+        agent_state["step_delay"] = max(0, min(int(seconds), MAX_STEP_DELAY_SECONDS))
+        state.entity_states["__agent__"] = agent_state
+        flag_modified(state, "entity_states")
+
+    @staticmethod
+    def set_wait_for_tts(state: SessionState, enabled: bool) -> None:
+        """In auto mode, start the next turn only after the narration was read aloud."""
+        agent_state = AgentService.get_agent_state(state)
+        agent_state["wait_for_tts"] = enabled
+        # Remembers the player's own choice, so starting the agent again keeps it.
+        agent_state["wait_for_tts_chosen"] = True
+        state.entity_states["__agent__"] = agent_state
+        flag_modified(state, "entity_states")
+
+    @staticmethod
+    def set_instruction(state: SessionState, text: str | None) -> str:
+        """Stores (or clears with "") the player's instruction; returns the stored text."""
+        agent_state = AgentService.get_agent_state(state)
+        instruction = normalize_instruction(text)
+        agent_state["instruction"] = instruction
+        if instruction:
+            # The player's instruction replaces a trip the agent was on.
+            agent_state.pop(TRAVEL_KEY, None)
+        state.entity_states["__agent__"] = agent_state
+        flag_modified(state, "entity_states")
+        return instruction
+
+    @staticmethod
+    def set_dialogue_level(state: SessionState, level: str) -> None:
+        """How much the agent talks with characters (see ``agent_dialogue.DIALOGUE_LEVELS``)."""
+        agent_state = AgentService.get_agent_state(state)
+        agent_state["dialogue_level"] = normalize_dialogue_level(level) or DEFAULT_DIALOGUE_LEVEL
         state.entity_states["__agent__"] = agent_state
         flag_modified(state, "entity_states")
 
@@ -405,27 +453,17 @@ class AgentService:
         builder = TurnLlmContextBuilder(manager)
         ctx = await builder.build_context(user_msg="", language=None)
 
-        scene_items_res = await db.execute(
-            select(WorldEntity).where(
-                WorldEntity.session_id == game_id,
-                WorldEntity.entity_type == "OBJECT",
-            )
-        )
-        scene_entities = list(scene_items_res.scalars().all())
-        states = state.entity_states or {}
-
-        visible_item_names = _collect_visible_scene_item_names(
-            scene_entities, states, state.current_scene_id
-        )
-        visible_scene_items_text = ", ".join(visible_item_names) if visible_item_names else "None"
-
         agent_state = AgentService.get_agent_state(state)
+        visible_scene_items_text = format_room_objects(
+            await load_room_entities(db, state), opened_container_ids(agent_state)
+        )
         objective_block, walkthrough_text = _build_agent_objective_and_walkthrough(
             adventure, state, agent_state
         )
         scene_exits = await load_scene_exits(db, game_id, state.current_scene_id)
+        known_map = format_known_map(await load_known_map(db, game_id, state))
         player_world_context = build_player_perception_context(
-            adventure, state, ctx, format_exits_for_agent(scene_exits)
+            adventure, state, ctx, f"{format_exits_for_agent(scene_exits)}\n\n{known_map}"
         )
 
         inventory_names = [
@@ -460,9 +498,14 @@ class AgentService:
             equipment=avatar.equipment or "None",
             protagonist_profile=format_protagonist_profile(avatar),
             personality_prompt=personality_prompt,
+            dialogue_prompt=dialogue_prompt(agent_state.get("dialogue_level")),
             mechanics_system_prompt=player_world_context,
             visible_scene_items_text=visible_scene_items_text,
+            memories_text=format_memories(agent_state),
+            abilities_text=await format_abilities_and_party(db, state, avatar),
+            objectives_text=format_objectives(adventure, state),
             walkthrough_text=walkthrough_text,
+            instruction_text=instruction_prompt(agent_state),
             objective_block=objective_block,
         )
 

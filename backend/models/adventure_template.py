@@ -69,6 +69,14 @@ class AdventureTemplate(Base, TimestampMixin):
     selected_tone: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     # How the GM narrates: {id, name, instruction, sample} (see core/narrator_voices.py)
     narrator_voice: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # Audio library: generated or uploaded tracks that scenes pick (engine/audio/audio_library.py).
+    audio_tracks: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
+    # Optional title track: a library track played while the adventure's library tile is hovered.
+    title_track_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # Author switch for scene audio; script audio (tw.audio) is not affected.
+    audio_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False, server_default="1"
+    )
     # Dialog skin chosen by the author: {"skin": <id>, "accent": "#rrggbb"} (see core/ui_theme.py)
     ui_theme: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
@@ -200,23 +208,28 @@ class AdventureTemplate(Base, TimestampMixin):
         flag_modified(self, "original_manifest")
 
     @property
-    def sequence_progression_mode(self) -> str:
-        """Returns sequence progression mode: 'linear' or 'dynamic'."""
-        if not self.original_manifest or not isinstance(self.original_manifest, dict):
-            return "linear"
-        mode = self.original_manifest.get(
-            "sequence_progression_mode"
-        ) or self.original_manifest.get("sequence_progression")
-        cleaned = str(mode or "linear").strip().lower()
-        return cleaned if cleaned in {"linear", "dynamic"} else "linear"
+    def dynamic_generation(self) -> dict[str, Any]:
+        """Returns dynamic scene generation settings from original_manifest."""
+        from backend.engine.world.dynamic_scene_schemas import normalize_dynamic_generation
 
-    @sequence_progression_mode.setter
-    def sequence_progression_mode(self, value: Optional[str]) -> None:
-        """Sets sequence_progression_mode inside original_manifest and marks original_manifest modified."""
+        manifest = self.original_manifest if isinstance(self.original_manifest, dict) else {}
+        adv_block = manifest.get("adventure") if isinstance(manifest.get("adventure"), dict) else {}
+        raw = manifest.get("dynamic_generation") or adv_block.get("dynamic_generation")
+        return normalize_dynamic_generation(raw)
+
+    @dynamic_generation.setter
+    def dynamic_generation(self, value: Optional[dict[str, Any]]) -> None:
+        """Stores dynamic_generation in original_manifest and mirrors into adventure block."""
+        from copy import deepcopy
+
         from sqlalchemy.orm.attributes import flag_modified
 
-        manifest = dict(self.original_manifest or {})
-        mode = str(value or "linear").strip().lower()
-        manifest["sequence_progression_mode"] = mode if mode in {"dynamic", "linear"} else "linear"
+        from backend.engine.world.dynamic_scene_schemas import normalize_dynamic_generation
+
+        manifest = deepcopy(self.original_manifest or {})
+        normalized = normalize_dynamic_generation(value)
+        manifest["dynamic_generation"] = normalized
+        if isinstance(manifest.get("adventure"), dict):
+            manifest["adventure"]["dynamic_generation"] = dict(normalized)
         self.original_manifest = manifest
         flag_modified(self, "original_manifest")
