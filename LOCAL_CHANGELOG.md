@@ -8,6 +8,48 @@ Record upstream bases, feature additions/removals, conflict resolutions, migrati
 
 No pending integration changes recorded.
 
+## 2026-11-19
+
+Upstream base: `e2e87d1ad560e5110acef65d0c1f4cf44847713e`
+
+Integration commit: `d5289b2e579feab162486210da1d4e673fda282e`
+
+Feature commit: `2f9d0469d812978c5f571a2c46f8347f665c3934`
+
+Added:
+
+- Synchronized 155 upstream commits and recomposed the integration with the isolated custom image feature.
+- Preserved custom image generation through upstream server-wide settings and personal API-key policies.
+- Preserved blocked effective-key policies even when no usable key is stored, with a regression test through `t2i_config`.
+- Applied 14 upstream migration files through Alembic head `cfa8f8fd4b9e`.
+
+Verified:
+
+- 280 targeted backend tests passed; Ruff check and format checks passed for all ten feature Python files.
+- Full backend suite: 2346 passed, 1 skipped, 12 unrelated upstream failures. Two Kimi failures were environment-dependent and passed with the default Moonshot base URL restored.
+- Frontend: 103 tests and production build passed.
+- Real backend health and authenticated settings calls returned 200 and exposed the custom image provider correctly.
+- Mocked custom `/images` generation, authorization, URL fallback, and key-policy preservation passed.
+- Database integrity and row counts were preserved; all migrated server settings semantically matched the source admin settings.
+- Pre-migration backup: `data/backups/taleweaver-pre-sync-20261119-090900.db`.
+- Incident backup before removing test contamination: `data/backups/taleweaver-post-test-contamination-20261119-091219.db`.
+
+Known upstream issues not changed by the local feature:
+
+- Full-suite failures cover five Play-Agent tests, one NPC persona format test, one prose test, and three skill-bundle checksum tests; the two Kimi tests also require an unpolluted default endpoint environment.
+- Frontend lint reports 32 errors and 56 warnings outside the feature.
+- The committed skill bundle already has a `package.json` checksum mismatch in upstream.
+- `tests/test_dynamic_challenges.py` imports the default engine/session directly; full test runs need explicit `DATABASE_URL` and `DATA_DIR` isolation to avoid writes to the application database.
+
+Not verified:
+
+- Live ZvenoAI image generation was not retested.
+- Poetry dev-dependency installation could not reach PyPI. Runtime dependencies were unchanged and `poetry install --only main` succeeded.
+
+Git notes:
+
+- No branches were pushed. `origin` remains at its pre-synchronization state.
+
 ## 2026-11-06
 
 Upstream base: `dbe1c925fd2d0f3617e62a1c935a11ef5c276f8d`
