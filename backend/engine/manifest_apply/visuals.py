@@ -91,7 +91,7 @@ def t2i_config(ctx: ApplyContext) -> tuple[dict, dict]:
     return {
         "t2i_settings": user.t2i_settings if user else None,
         **llm_settings,
-    }, copy.copy(keys) if keys else {}
+    }, copy.copy(keys) if keys is not None else {}
 
 
 def uses_advanced_model(ctx: ApplyContext, setting: str, default: str) -> bool:

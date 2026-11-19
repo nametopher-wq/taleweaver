@@ -1,6 +1,7 @@
 """Personal API keys and the key policy: resolution, env precedence, isolation, endpoints."""
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -124,6 +125,19 @@ async def test_sources_survive_the_image_pipeline_copy():
     keys = build_effective_keys({}, {"openai": "user_required"})
 
     assert key_source(copy.copy(keys), "openai") == SOURCE_MISSING
+
+
+async def test_sources_survive_t2i_config_with_no_available_keys():
+    from backend.engine.manifest_apply.visuals import t2i_config
+
+    keys = build_effective_keys({}, {"custom_openai": "user_required"})
+    user = SimpleNamespace(encrypted_api_keys=keys, llm_settings={}, t2i_settings={})
+
+    _, copied = t2i_config(SimpleNamespace(user=user))
+
+    assert key_source(copied, "custom_openai") == SOURCE_MISSING
+    with pytest.raises(PersonalKeyRequiredError):
+        resolve_api_key(copied, "custom_openai")
 
 
 async def test_plain_dicts_keep_server_semantics(no_env_keys):
